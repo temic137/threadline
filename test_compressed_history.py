@@ -118,6 +118,103 @@ def test_older_segment_adds_only_what_the_database_lacks(setup):
     assert "listing" in [e["content"] for e in events]
 
 
+def test_database_may_hold_an_older_segment_than_rollout_path_names(tmp_path):
+    home, project = tmp_path / "home", tmp_path / "project"
+    project.mkdir()
+    first = write_rollout(home, MAIN, project, [user("first request"), call("c1", "ls"), output("c1", "listing"), agent("first reply"),
+                                                user("second request"), call("c2", "pwd"), output("c2", "folder"), agent("second reply")])
+    middle_change = {"type": "event_msg", "payload": {"type": "item_completed", "item": {"type": "FileChange", "changes": [{"path": "m.py"}], "status": "completed"}}}
+    middle = first.with_name(f"rollout-2026-01-02T00-00-00-{MAIN}_44444444-4444-4444-8444-444444444444.jsonl.zst")
+    # Codex replays an earlier message when it starts a new file; that must not look like the same segment.
+    lines = [{"type": "session_meta", "payload": {"id": MAIN, "cwd": str(project)}}, user("second request"), user("third request"), call("c3", "date"), output("c3", "today"), middle_change, agent("third reply")]
+    # The database fixture is dated November 2026, so this later segment is dated after it.
+    middle.write_bytes(zstandard.ZstdCompressor().compress("".join(json.dumps({"timestamp": "2026-12-01T00:00:00Z", **x}) + "\n" for x in lines).encode()))
+    _, history = databases(home, project, MAIN, str(first.with_name("rollout-2026-01-03T00-00-00-latest.jsonl")))
+    item(history, MAIN, 1, "userMessage", content=[{"type": "text", "text": "first request"}])
+    item(history, MAIN, 4, "agentMessage", text="first reply")
+    item(history, MAIN, 5, "userMessage", content=[{"type": "text", "text": "second request"}])
+    item(history, MAIN, 8, "agentMessage", text="second reply")
+    journal = Journal(tmp_path / "j.db")
+    try:
+        synchronize(journal, project, home, "codex")
+        groups = [[e["content"] for e in group if e["kind"] != "file_change"] for group in journal.exchanges(project, "codex", MAIN)]
+        assert groups == [["first request", "ls", "listing", "first reply"], ["second request", "pwd", "folder", "second reply"],
+                          ["third request", "date", "today", "third reply"]]
+        assert [e["kind"] for e in journal.exchanges(project, "codex", MAIN)[2]].count("file_change") == 1
+    finally:
+        journal.close()
+
+
+def test_rows_from_before_codex_compressed_a_file_are_replaced(tmp_path):
+    home, project = tmp_path / "home", tmp_path / "project"
+    project.mkdir()
+    records = [user("only request"), call("c1", "ls"), output("c1", "listing"), agent("only reply")]
+    compressed = write_rollout(home, MAIN, project, records)
+    plain = compressed.with_suffix("")
+    plain.write_bytes(zstandard.ZstdDecompressor().stream_reader(compressed.read_bytes()).read())
+    compressed.unlink()
+    databases(home, project, MAIN, str(plain))
+    journal = Journal(tmp_path / "j.db")
+    try:
+        synchronize(journal, project, home, "codex")
+        count = len([e for g in journal.exchanges(project, "codex", MAIN) for e in g])
+        assert count == 4
+        compressed.write_bytes(zstandard.ZstdCompressor().compress(plain.read_bytes()))
+        plain.unlink()
+        _, report = synchronize(journal, project, home, "codex")
+        contents = [e["content"] for g in journal.exchanges(project, "codex", MAIN) for e in g]
+        assert contents.count("only request") == 1 and len(contents) == count
+        assert "unavailable" not in [c["status"] for c in report["conversations"] if str(plain) in c["path"]]
+    finally:
+        journal.close()
+
+
+def test_repeated_words_in_a_later_file_are_not_treated_as_already_captured(tmp_path):
+    home, project = tmp_path / "home", tmp_path / "project"
+    project.mkdir()
+    folder = home / ".codex" / "sessions" / "2026" / "01" / "01"
+    folder.mkdir(parents=True)
+    # The database holds an older file, but rollout_path names this newer one.
+    latest = folder / f"rollout-2026-01-03T00-00-00-{MAIN}_55555555-5555-4555-8555-555555555555.jsonl"
+    lines = [{"type": "session_meta", "payload": {"id": MAIN, "cwd": str(project)}}, user("new work"), agent("sure"), user("ok do that"), call("c9", "ls"), output("c9", "listing"), agent("done")]
+    latest.write_text("".join(json.dumps({"timestamp": "2026-12-01T00:00:00Z", **x}) + "\n" for x in lines), encoding="utf-8")
+    _, history = databases(home, project, MAIN, str(latest))
+    item(history, MAIN, 40, "userMessage", content=[{"type": "text", "text": "ok do that"}])
+    item(history, MAIN, 41, "agentMessage", text="an old reply")
+    with closing(sqlite3.connect(history)) as db, db:
+        db.execute("INSERT INTO thread_history_projection_state VALUES (?,?,?)", (MAIN, 50, 0))
+    journal = Journal(tmp_path / "j.db")
+    try:
+        synchronize(journal, project, home, "codex")
+        groups = [[e["content"] for e in group] for group in journal.exchanges(project, "codex", MAIN)]
+        assert groups == [["ok do that", "an old reply"], ["new work", "sure"], ["ok do that", "ls", "listing", "done"]]
+    finally:
+        journal.close()
+
+
+def raw_user(text):
+    return {"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}}
+
+
+def test_request_recorded_only_as_a_raw_message_is_kept_once(tmp_path):
+    home, project = tmp_path / "home", tmp_path / "project"
+    project.mkdir()
+    write_rollout(home, MAIN, project, [
+        raw_user("<environment_context>ignored</environment_context>"),
+        raw_user("first request, ok do that later <image>tag</image>"), user("first request, ok do that later"), agent("first reply"),
+        raw_user("ok do that"), call("c1", "ls"), output("c1", "listing"), agent("done")])
+    databases(home, project, "unrelated")
+    with closing(sqlite3.connect(home / ".codex" / "state_5.sqlite")) as db, db:
+        db.execute("INSERT INTO threads VALUES (?,?,?,?,?)", (MAIN, str(project), "", "vscode", "Chat"))
+    journal = Journal(tmp_path / "j.db")
+    try:
+        synchronize(journal, project, home, "codex")
+        groups = [[e["content"] for e in group] for group in journal.exchanges(project, "codex", MAIN)]
+        assert groups == [["first request, ok do that later", "first reply"], ["ok do that", "ls", "listing", "done"]]
+    finally:
+        journal.close()
+
+
 def test_other_projects_compressed_files_are_never_opened(setup):
     journal, project, home, *_ = setup
     folder = home / ".codex" / "sessions" / "2026" / "01" / "01"

@@ -42,7 +42,13 @@ EVENT_IMPORTANCE = {
 }
 
 
+# Every pattern needs one of these, so most text can skip the full list.
+_SECRET_HINT = re.compile(r"(?i)api[_-]?key|bearer|sk-|xox[a-z]-|xapp-|aiza|eyj|://|token|secret|passw|private|gh[pousr]_|akia")
+
+
 def redact(text: str) -> str:
+    if not _SECRET_HINT.search(text):
+        return text
     for pattern, replacement in SECRET_PATTERNS:
         text = pattern.sub(replacement, text)
     return text
@@ -143,8 +149,12 @@ def make_event(source: str, session_id: str, ordinal: int, kind: str, actor: str
 
 def read_codex(path: Path) -> dict:
     session_id, project, events = path.stem, "", []
+    raw_requests = []
     for ordinal, record in read_jsonl(path):
         payload = record.get("payload", {})
+        if record.get("type") == "response_item" and payload.get("type") == "message" and payload.get("role") == "user":
+            raw_requests.append((ordinal, record.get("timestamp", ""), text_of(payload.get("content"))))
+            continue
         if record.get("type") == "session_meta":
             session_id = payload.get("id") or payload.get("session_id") or session_id
             project = payload.get("cwd", project)
@@ -188,6 +198,23 @@ def read_codex(path: Path) -> dict:
             events.append(make_event("codex", session_id, ordinal, "file_change", "assistant",
                                      text_of(item.get("stdout") or item.get("stderr") or item.get("changes")), timestamp,
                                      {"changes": item.get("changes", []), "status": item.get("status", "")}))
+    # Some requests exist only as raw messages. Raw text can add tags around the same message.
+    recorded = [" ".join(e["content"].split()) for e in events if e["kind"] == "user_message"]
+    added = False
+    for ordinal, timestamp, text in raw_requests:
+        flat = " ".join(text.split())
+        if not flat or flat.startswith("<"):
+            continue
+        # Tags trail the message, so compare from the start; a short phrase inside a longer
+        # message is a different request.
+        match = next((known for known in recorded if known and (flat.startswith(known) or (known.startswith(flat) and len(flat) * 2 >= len(known)))), None)
+        if match is not None:
+            recorded.remove(match)
+            continue
+        events.append(make_event("codex", session_id, ordinal, "user_message", "user", text, timestamp))
+        added = True
+    if added:
+        events.sort(key=lambda event: event["ordinal"])
     return session("codex", session_id, project, path, events)
 
 

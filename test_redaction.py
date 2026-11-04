@@ -69,3 +69,25 @@ def test_old_journal_is_cleaned_once_and_stays_usable(tmp_path):
         assert SLACK not in json.dumps(stored_report(journal, tmp_path))
     finally:
         journal.close()
+
+
+def test_cleaning_an_old_journal_keeps_stored_json_valid(tmp_path):
+    journal = Journal(tmp_path / "j.db")
+    project = str(tmp_path)
+    tricky = {"command": 'set SLACK_TOKEN=abcd1234" && echo "DB_PASSWORD=hunter2hunter2\\"', "url": "postgres://u:Sup3rSecretValue@host/db"}
+    try:
+        initialize(journal.db)
+        event = make_event("codex", "A", 0, "tool_call", "assistant", "call", "2026-01-01T00:00:00Z", tricky)
+        journal.import_session({"id": "A", "source": "codex", "project": project, "path": str(tmp_path / "A"), "updated": "2026-01-01", "events": [event]})
+        journal.db.execute("INSERT INTO capture_reports VALUES (?,?)", (project, json.dumps({"project": project, "note": tricky})))
+        journal.db.execute("UPDATE journal_meta SET value='1' WHERE key='redaction_version'")
+        journal.db.commit()
+
+        initialize(journal.db)
+
+        metadata = journal.get([event["id"]])[0]["metadata"]
+        assert "Sup3rSecretValue" not in json.dumps(metadata) and "hunter2hunter2" not in json.dumps(metadata)
+        assert "abcd1234" not in json.dumps(stored_report(journal, tmp_path))
+        assert journal.exchanges(tmp_path, "codex", "A")[0][0]["id"] == event["id"]
+    finally:
+        journal.close()

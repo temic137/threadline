@@ -204,12 +204,27 @@ def scrub_journal(db):
     tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type IN ('table','view')")}
     targets = {"events": ("content", "metadata"), "capture_records": ("payload",), "capture_state": ("details",),
                "capture_reports": ("report",), "decision_annotations": ("payload",)}
+    plain_text = {"content"}
+
+    def cleaned_value(column, value):
+        if not isinstance(value, str):
+            return value
+        if column in plain_text:
+            return redact(value)
+        # Redacting serialized JSON could remove an escape and corrupt it, so clean the values.
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return redact(value)
+        clean = sanitize_value(parsed)
+        return value if clean == parsed else json.dumps(clean, ensure_ascii=False)
+
     with db:
         for table, columns in targets.items():
             if table not in tables:
                 continue
             for rowid, *values in db.execute(f"SELECT rowid,{','.join(columns)} FROM {table}").fetchall():
-                cleaned = [redact(value) if isinstance(value, str) else value for value in values]
+                cleaned = [cleaned_value(column, value) for column, value in zip(columns, values)]
                 if cleaned != values:
                     assignment = ",".join(column + "=?" for column in columns)
                     db.execute(f"UPDATE {table} SET {assignment} WHERE rowid=?", (*cleaned, rowid))
@@ -477,7 +492,9 @@ def synchronize(journal, project, home, source="auto", selected=None):
                     retained = []
                     for event in captured["events"]:
                         signature = event_signature({**event, "content": redact(str(event["content"]))})
-                        if event["ordinal"] < cursor and matches[signature]:
+                        # Identical words on another line are a separate message, such as a second "ok".
+                        if (event["ordinal"] < cursor and matches[signature]
+                                and {(signature, event["ordinal"] * 10), (signature, event["ordinal"] * 10 + 1)} & sqlite_signatures[sid][2]):
                             matches[signature] -= 1
                             continue
                         if compressed and event["ordinal"] < cursor and event["kind"] == "file_change":
@@ -495,15 +512,24 @@ def synchronize(journal, project, home, source="auto", selected=None):
                     if not compressed and any(e["ordinal"] < cursor for e in retained):
                         gaps.append("Some JSONL records before the SQLite projection boundary have no exact normalized match; retained rather than discarded. Duplicate tool activity or source-order differences may remain.")
                 elif compressed and sid in sqlite_signatures:
-                    # An older segment of a thread the database already holds: keep what it adds.
-                    matches = Counter(sqlite_signatures[sid][1])
-                    retained = []
+                    # The database can hold any one segment of a thread, whatever rollout_path
+                    # says. Later segments replay some messages, so only messages on the same
+                    # rollout lines identify that segment; other segments stand alone.
+                    _, signatures, positions = sqlite_signatures[sid]
+                    matches = Counter(signatures)
+                    retained, shared, aligned = [], 0, 0
                     for event in captured["events"]:
                         signature = event_signature({**event, "content": redact(str(event["content"]))})
                         if matches[signature]:
                             matches[signature] -= 1
-                        elif event["kind"] != "file_change":
+                            shared += 1
+                            aligned += (signature, event["ordinal"] * 10) in positions
+                        else:
                             retained.append(event)
+                    if aligned and aligned * 2 >= shared:
+                        retained = [e for e in retained if e["kind"] != "file_change"]
+                        for event in retained:
+                            event["metadata"].update(rollout_line=event["ordinal"], overlay_of=str(state_path.resolve()))
                     captured["events"] = retained
                 elif kind == "codex" and not is_codex_db and sid in sqlite_threads:
                     gaps.append("SQLite and this continuation segment overlap without a confirmed projection boundary; both retained, duplicate exchanges may appear.")
@@ -548,6 +574,13 @@ def synchronize(journal, project, home, source="auto", selected=None):
                 # Source revisions are append-only; normalized events reflect the latest source snapshot.
                 with journal.db:
                     new_records, new_events = 0, 0
+                    if compressed:
+                        # Codex compressed this file after an earlier capture; this replaces those rows.
+                        earlier = (str(project), kind, sid, str(path.with_suffix("").resolve()))
+                        for (event_id,) in journal.db.execute("SELECT event_id FROM capture_event_links WHERE project=? AND source=? AND session_id=? AND location=?", earlier).fetchall():
+                            journal.db.execute("DELETE FROM events WHERE id=?", (event_id,))
+                        journal.db.execute("DELETE FROM capture_event_links WHERE project=? AND source=? AND session_id=? AND location=?", earlier)
+                        journal.db.execute("DELETE FROM capture_state WHERE project=? AND source=? AND session_id=? AND location=?", earlier)
                     manifest = []
                     for (key, original), (_, value) in zip(rows, clean_rows):
                         payload = json.dumps(value, ensure_ascii=False, sort_keys=True)
@@ -585,7 +618,8 @@ def synchronize(journal, project, home, source="auto", selected=None):
                     if is_codex_db and captured["events"]:
                         sqlite_threads.add(sid)
                         signatures = Counter(event_signature(e) for e in captured["events"])
-                        sqlite_signatures[sid] = (hashlib.sha256(json.dumps([e["id"] for e in captured["events"]]).encode()).hexdigest(), signatures)
+                        sqlite_signatures[sid] = (hashlib.sha256(json.dumps([e["id"] for e in captured["events"]]).encode()).hexdigest(), signatures,
+                                                  {(event_signature(e), e["ordinal"]) for e in captured["events"]})
                     if is_codex_db and metadata.get("projected_rollout_ordinal") is not None and metadata.get("rollout_path"):
                         signatures = Counter(event_signature(e) for e in captured["events"])
                         overlap_digest = hashlib.sha256(json.dumps([e["id"] for e in captured["events"]]).encode()).hexdigest()
