@@ -13,13 +13,23 @@ from urllib.parse import unquote, urlparse
 
 SECRET_PATTERNS = [
     (re.compile(r"(?i)(api[_-]?key\s*[:=]\s*)(['\"]?)[^\s'\"]+\2"), r"\1\2[REDACTED]\2"),
-    (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-~+/=]+"), r"\1[REDACTED]"),
-    (re.compile(r"(?i)sk-[A-Za-z0-9]{8,}"), "[REDACTED]"),
+    # A digit or some length separates a credential from prose such as "bearer token".
+    (re.compile(r"(?i)(bearer\s+)(?=[A-Za-z0-9._\-~+/=]*[0-9]|[A-Za-z0-9._\-~+/=]{20,})[A-Za-z0-9._\-~+/=]+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)\bsk-[A-Za-z0-9_-]{8,}"), "[REDACTED]"),
+    (re.compile(r"\bxox[a-z]-[A-Za-z0-9-]{8,}"), "[REDACTED]"),
+    (re.compile(r"\bxapp-[A-Za-z0-9-]{8,}"), "[REDACTED]"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{30,}"), "[REDACTED]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"), "[REDACTED]"),
+    (re.compile(r"""\b([a-z][a-z0-9+.-]*://[^\s:/@'"]*:)[^\s@'"/]+(@)""", re.I), r"\1[REDACTED]\2"),
+    (re.compile(r"""\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE_KEY)[A-Z0-9_]*\s*[:=]\s*)(['"]?)[^\s'"(){}$<>]{4,}\2"""), r"\1\2[REDACTED]\2"),
     (re.compile(r"(?i)(x-api-key\s*[:=]\s*)(['\"]?)[^\s'\"]+\2"), r"\1\2[REDACTED]\2"),
     (re.compile(r"(?i)gh[pousr]_[A-Za-z0-9]{20,}"), "[REDACTED]"),
     (re.compile(r"AKIA[0-9A-Z]{16}"), "[REDACTED]"),
     (re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"), "[REDACTED PRIVATE KEY]"),
 ]
+
+# Raise this when SECRET_PATTERNS change, so existing journals are cleaned once.
+REDACTION_VERSION = 2
 
 EVENT_IMPORTANCE = {
     "user_message": 100,

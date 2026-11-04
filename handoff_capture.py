@@ -8,7 +8,7 @@ from collections import Counter
 from contextlib import closing
 
 from handoff_sessions import (
-    READERS, candidate_meta, candidate_paths, make_event, read_cursor,
+    READERS, REDACTION_VERSION, candidate_meta, candidate_paths, make_event, read_cursor, redact,
     sanitize_session, sanitize_value, session, text_of,
 )
 
@@ -184,12 +184,39 @@ def initialize(db):
             PRIMARY KEY(project, source, session_id, location, event_id)
         );
         CREATE INDEX IF NOT EXISTS capture_event_links_event_location ON capture_event_links(event_id,location);
+        CREATE TABLE IF NOT EXISTS journal_meta (key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE IF NOT EXISTS capture_snapshots (
             project TEXT, source TEXT, session_id TEXT, location TEXT, digest TEXT,
             captured_at TEXT, manifest TEXT,
             PRIMARY KEY(project, source, session_id, location, digest)
         );
     """)
+    scrub_journal(db)
+
+
+def scrub_journal(db):
+    """Apply current redaction to history stored under older rules. IDs stay stable so links still
+    resolve; rows that held a secret are replaced under new IDs at the next capture."""
+    row = db.execute("SELECT value FROM journal_meta WHERE key='redaction_version'").fetchone()
+    if row and int(row[0]) >= REDACTION_VERSION:
+        return
+    tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type IN ('table','view')")}
+    targets = {"events": ("content", "metadata"), "capture_records": ("payload",), "capture_state": ("details",),
+               "capture_reports": ("report",), "decision_annotations": ("payload",)}
+    with db:
+        for table, columns in targets.items():
+            if table not in tables:
+                continue
+            for rowid, *values in db.execute(f"SELECT rowid,{','.join(columns)} FROM {table}").fetchall():
+                cleaned = [redact(value) if isinstance(value, str) else value for value in values]
+                if cleaned != values:
+                    assignment = ",".join(column + "=?" for column in columns)
+                    db.execute(f"UPDATE {table} SET {assignment} WHERE rowid=?", (*cleaned, rowid))
+        if "events_fts" in tables:
+            for rowid, content, metadata in db.execute("SELECT rowid,content,metadata FROM events_fts").fetchall():
+                if redact(content) != content or redact(metadata) != metadata:
+                    db.execute("UPDATE events_fts SET content=?,metadata=? WHERE rowid=?", (redact(content), redact(metadata), rowid))
+        db.execute("INSERT OR REPLACE INTO journal_meta VALUES ('redaction_version',?)", (str(REDACTION_VERSION),))
 
 
 def stored_report(journal, project):
