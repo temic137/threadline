@@ -320,8 +320,9 @@ def cursor_conversations(path, project):
                 sid = header["composerId"]
                 rows = [("header", dict(header))]
                 prefix = f"bubbleId:{sid}:"
-                for key, value in db.execute("SELECT key,value FROM cursorDiskKV WHERE substr(key,1,?)=?",
-                                             (len(prefix), prefix)):
+                # A range uses the key index, so each chat does not scan every chat's rows.
+                for key, value in db.execute("SELECT key,value FROM cursorDiskKV WHERE key>=? AND key<?",
+                                             (prefix, prefix[:-1] + ";")):
                     try:
                         value = json.loads(value)
                     except (ValueError, TypeError):
@@ -341,7 +342,7 @@ def cursor_conversations(path, project):
                     if isinstance(tool, dict):
                         events.append(make_event("cursor", sid, ordinal, "tool_result", "tool",
                                                  str(tool.get("result", "")), str(item.get("createdAt", "")),
-                                                 {"source_key": key, **tool}))
+                                                 cursor_tool_metadata(key, tool)))
                 captured = session("cursor", sid, str(project), path, events)
                 yield captured, rows, ["Cursor rows preserved; attachment files are not copied."], dict(header)
         return
@@ -358,6 +359,59 @@ def cursor_conversations(path, project):
     yield read_cursor(path, project), rows, [
         "Legacy Cursor storage: conversation boundaries unsupported; captured workspace records as one collection."
     ], {}
+
+
+# Source files stay on disk, so the journal keeps what resume and search need, not a second copy.
+RAW_RECORD_LIMIT = 2000
+TOOL_ARGUMENT_LIMIT = 2000
+TOOL_CONTENT_HEAD = 6000
+TOOL_CONTENT_TAIL = 2000
+MESSAGE_KINDS = ("user_message", "assistant_message")
+
+
+def shortened_tool_content(content):
+    """Keep the start and end of a long tool output. People's messages are never shortened."""
+    if len(content) <= TOOL_CONTENT_HEAD + TOOL_CONTENT_TAIL:
+        return None
+    omitted = len(content) - TOOL_CONTENT_HEAD - TOOL_CONTENT_TAIL
+    return f"{content[:TOOL_CONTENT_HEAD]}\n[... {omitted} characters not stored; metadata.source_path has the original ...]\n{content[-TOOL_CONTENT_TAIL:]}"
+
+
+def cursor_tool_metadata(key, tool):
+    """Cursor's tool data repeats the result and adds binary copies; keep what identifies the call."""
+    arguments = tool.get("rawArgs") or tool.get("params") or ""
+    arguments = arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False)
+    return {"source_key": key, "name": tool.get("name", ""), "status": tool.get("status", ""),
+            "toolCallId": tool.get("toolCallId", ""), "tool_id": tool.get("toolCallId", ""),
+            "arguments": arguments[:TOOL_ARGUMENT_LIMIT]}
+
+
+def codex_thread_homes(state_path):
+    """A chat can change folders. The state database records where it lives now, for all its files."""
+    if not state_path:
+        return {}
+    homes, resolved = {}, {}
+    with closing(sqlite3.connect(f"file:{Path(state_path).resolve().as_posix()}?mode=ro", uri=True)) as db:
+        for thread, cwd in db.execute("SELECT id,cwd FROM threads WHERE cwd IS NOT NULL AND cwd<>''"):
+            if cwd not in resolved:
+                resolved[cwd] = workspace_path(cwd)
+            homes[thread] = resolved[cwd]
+    return homes
+
+
+def codex_source_stamp(candidates, state_path, history_path):
+    parts = [str(REDACTION_VERSION)]
+    for path in (state_path, history_path):
+        if path:
+            wal = Path(str(path) + "-wal")
+            parts += [str(path), file_stamp(path), file_stamp(wal) if wal.exists() else ""]
+    parts += sorted(f"{path}:{file_stamp(path)}" for kind, path, _ in candidates if kind == "codex")
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()
+
+
+def file_stamp(path):
+    stat = path.stat()
+    return f"{stat.st_size}:{stat.st_mtime_ns}"
 
 
 ROLLOUT_THREAD = re.compile(r"^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
@@ -410,12 +464,13 @@ def jsonl_capture(kind, path):
                                           e["content"], e["timestamp"], e["metadata"]) for e in captured["events"]]
     if not rows:
         gaps.append("Empty source file.")
-    gaps.append("All source records archived; normalization covers selected message/tool types only. Attachment files are not copied.")
+    gaps.append(f"Source records up to {RAW_RECORD_LIMIT} characters archived; larger ones stay in the source file. Normalization covers selected message/tool types only. Attachment files are not copied.")
     return captured, rows, gaps, metadata
 
 
-def synchronize(journal, project, home, source="auto", selected=None):
-    """Archive all exact-workspace matches, preserving revisions and explicit gaps."""
+def synchronize(journal, project, home, source="auto", selected=None, reread=False):
+    """Archive all exact-workspace matches, preserving revisions and explicit gaps.
+    Unchanged sources are skipped and not returned; reread=True returns every chat for exports."""
     project = workspace_path(project)
     initialize(journal.db)
     report = {"project": str(project), "captured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -431,13 +486,41 @@ def synchronize(journal, project, home, source="auto", selected=None):
         report["gaps"].append({"source": "codex", "path": str(history_path), "reason": "History database found without a state database; project association unavailable, not imported."})
     projected, sqlite_threads, state_threads, sqlite_signatures = {}, set(), set(), {}
     skipped_unchanged = 0
+    skipped_chats = set()
     kinds = ("codex", "claude", "cursor", "muse") if source == "auto" else (source,)
     report["sources"] = {kind: {"candidate_files": sum(k == kind for k, _, _ in candidates)} for kind in kinds}
     if "codex" in report["sources"]:
         report["sources"]["codex"]["sqlite_databases"] = {"state": str(state_path) if state_path else None,
                                                         "history": str(history_path) if history_path else None}
-    for kind, path, known_project in candidates:
+    thread_homes = {}
+    try:
+        thread_homes = codex_thread_homes(state_path)
+    except sqlite3.Error as exc:
+        report["gaps"].append({"source": "codex", "path": str(state_path), "reason": f"Could not read chat folders: {exc}"})
+    # When no Codex file changed, nothing below could change this project's Codex history.
+    codex_stamp, codex_skip, codex_key = None, False, f"codex_stamp:{project}"
+    if state_path and not selected and not reread:
         try:
+            codex_stamp = codex_source_stamp(candidates, state_path, history_path)
+        except OSError:
+            codex_stamp = None
+        known_stamp = journal.db.execute("SELECT value FROM journal_meta WHERE key=?", (codex_key,)).fetchone()
+        stored = journal.db.execute("SELECT session_id,location,details FROM capture_state WHERE project=? AND source='codex'", (str(project),)).fetchall()
+        if codex_stamp and known_stamp and known_stamp[0] == codex_stamp and stored:
+            codex_skip = True
+            for session_id, location, stored_details in stored:
+                details = json.loads(stored_details)
+                if details.get("status") != "identity_conflict":
+                    details["status"] = "unchanged"
+                    skipped_chats.add(("codex", session_id))
+                report["conversations"].append(details)
+                seen.add((str(project), "codex", session_id, location))
+                skipped_unchanged += 1
+    for kind, path, known_project in candidates:
+        if kind == "codex" and codex_skip:
+            continue
+        try:
+            stamp = None
             is_codex_db = kind == "codex" and path == state_path
             compressed = kind == "codex" and path.suffix == ".zst"
             if compressed:
@@ -453,9 +536,28 @@ def synchronize(journal, project, home, source="auto", selected=None):
             elif kind == "cursor":
                 if not known_project or workspace_path(known_project) != project:
                     continue
+                location = str(path.resolve())
+                wal = path.with_name(path.name + "-wal")
+                cursor_stamp = f"cursor-v1:{REDACTION_VERSION}:{file_stamp(path)}:{file_stamp(wal) if wal.exists() else ''}"
+                cursor_key = f"cursor_stamp:{project}:{location}"
+                known = journal.db.execute("SELECT value FROM journal_meta WHERE key=?", (cursor_key,)).fetchone()
+                captured_before = journal.db.execute("SELECT session_id,details FROM capture_state WHERE project=? AND source='cursor' AND location=?",
+                                                     (str(project), location)).fetchall()
+                if not reread and not selected and known and known[0] == cursor_stamp and captured_before:
+                    for session_id, stored in captured_before:
+                        details = json.loads(stored)
+                        if details.get("status") != "identity_conflict":
+                            details["status"] = "unchanged"
+                            skipped_chats.add((kind, session_id))
+                        report["conversations"].append(details)
+                        seen.add((str(project), kind, session_id, location))
+                        skipped_unchanged += 1
+                    continue
                 entries = cursor_conversations(path, project)
             else:
                 sid, workspace = candidate_meta(kind, path, known_project)
+                if kind == "codex" and sid in thread_homes:
+                    workspace = str(thread_homes[sid])
                 if not workspace:
                     report["gaps"].append({"source": kind, "path": str(path), "reason": "Project association unavailable; source not imported."})
                     continue
@@ -464,22 +566,22 @@ def synchronize(journal, project, home, source="auto", selected=None):
                 selection_id = sid + "/" + path.stem if kind == "claude" and "subagents" in path.parts else sid
                 if selected and selected != selection_id and selected not in str(path):
                     continue
-                if compressed:
-                    identity = (str(project), kind, sid, str(path.resolve()))
+                if not selected:
+                    identity = (str(project), kind, selection_id, str(path.resolve()))
                     stat = path.stat()
-                    boundary = projected.get((sid, workspace_path(path.with_suffix(""))))
+                    boundary = projected.get((sid, workspace_path(path.with_suffix("") if compressed else path)))
                     stamp = f"rollout-v1:{REDACTION_VERSION}:{stat.st_size}:{stat.st_mtime_ns}:{boundary[2] if boundary else sqlite_signatures.get(sid, ('',))[0]}"
                     row = journal.db.execute("SELECT details FROM capture_state WHERE project=? AND source=? AND session_id=? AND location=?", identity).fetchone()
-                    if row and json.loads(row[0]).get("source_stamp") == stamp:
+                    if not reread and row and json.loads(row[0]).get("source_stamp") == stamp:
                         details = json.loads(row[0])
-                        details["status"] = "unchanged"
+                        if details.get("status") != "identity_conflict":
+                            details["status"] = "unchanged"
+                            skipped_chats.add((kind, details.get("session_id", selection_id)))
                         seen.add(identity)
                         report["conversations"].append(details)
                         skipped_unchanged += 1
                         continue
-                    entries = [compressed_capture(path)]
-                else:
-                    entries = [jsonl_capture(kind, path)]
+                entries = [compressed_capture(path) if compressed else jsonl_capture(kind, path)]
             for captured, rows, gaps, metadata in entries:
                 sid = captured["id"]
                 if selected and selected != sid and selected not in str(path):
@@ -537,6 +639,10 @@ def synchronize(journal, project, home, source="auto", selected=None):
                 seen.add(identity)
                 clean_rows = []
                 for key, value in rows:
+                    raw = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+                    if len(raw) > RAW_RECORD_LIMIT:
+                        clean_rows.append((str(key), json.dumps({"not_copied_chars": len(raw)}), hashlib.sha256(raw.encode()).hexdigest(), False))
+                        continue
                     clean = sanitize_value(value)
                     if is_codex_db and isinstance(clean, dict):
                         for field in ("item_json", "error_json", "payload"):
@@ -545,8 +651,9 @@ def synchronize(journal, project, home, source="auto", selected=None):
                                     clean[field] = json.dumps(sanitize_value(json.loads(value[field])), ensure_ascii=False)
                                 except ValueError:
                                     pass
-                    clean_rows.append((str(key), clean))
-                serialized = json.dumps(clean_rows, ensure_ascii=False, sort_keys=True)
+                    payload = json.dumps(clean, ensure_ascii=False, sort_keys=True, default=str)
+                    clean_rows.append((str(key), payload, hashlib.sha256(payload.encode()).hexdigest(), value != clean))
+                serialized = json.dumps([[key, record_digest] for key, _, record_digest, _ in clean_rows])
                 policy = "codex-sqlite-v1:" if is_codex_db else (f"codex-overlap-v1:{cursor}:{overlap_digest}:" if projection is not None else "capture-v3:")
                 if compressed:
                     policy = stamp
@@ -557,12 +664,16 @@ def synchronize(journal, project, home, source="auto", selected=None):
                            "status": "unchanged" if previous and previous[0] == digest else "imported",
                            "metadata": sanitize_value({key: value for key, value in metadata.items() if key not in ("base_instructions", "dynamic_tools")}),
                            "gaps": gaps, "redacted_records": 0}
-                if compressed:
+                if stamp:
                     details["source_stamp"] = stamp
                 details["record_types"], details["archive_only_record_types"] = record_types(kind, rows)
                 owner = journal.db.execute("SELECT project, source_path FROM sessions WHERE source=? AND id=?",
                                            (kind, sid)).fetchone()
                 conflict = owner and owner["project"] != str(project)
+                if conflict and kind == "codex" and thread_homes.get(sid) == project:
+                    # Codex moved this chat here, so it no longer belongs under its old folder.
+                    journal.delete(Path(owner["project"]), sid)
+                    conflict = False
                 if conflict:
                     details["status"] = "identity_conflict"
                     gaps.append("Native session ID already belongs to another source location/project; records archived but normalized history not replaced.")
@@ -571,6 +682,13 @@ def synchronize(journal, project, home, source="auto", selected=None):
                 captured["events"] = [make_event(kind, sid, e["ordinal"], e["kind"], e["actor"],
                                                  e["content"], e["timestamp"], {**e["metadata"], "source_path": location, "capture_order": order})
                                       for order, e in enumerate(captured["events"])]
+                full_events = captured["events"]
+                captured["events"] = []
+                for e in full_events:
+                    short = None if e["kind"] in MESSAGE_KINDS else shortened_tool_content(e["content"])
+                    captured["events"].append(e if short is None else make_event(
+                        kind, sid, e["ordinal"], e["kind"], e["actor"], short, e["timestamp"],
+                        {**e["metadata"], "full_chars": len(e["content"])}))
                 # Source revisions are append-only; normalized events reflect the latest source snapshot.
                 with journal.db:
                     new_records, new_events = 0, 0
@@ -582,15 +700,12 @@ def synchronize(journal, project, home, source="auto", selected=None):
                         journal.db.execute("DELETE FROM capture_event_links WHERE project=? AND source=? AND session_id=? AND location=?", earlier)
                         journal.db.execute("DELETE FROM capture_state WHERE project=? AND source=? AND session_id=? AND location=?", earlier)
                     manifest = []
-                    for (key, original), (_, value) in zip(rows, clean_rows):
-                        payload = json.dumps(value, ensure_ascii=False, sort_keys=True)
-                        redacted = original != value
+                    for key, payload, record_digest, redacted in clean_rows:
                         details["redacted_records"] += int(redacted)
-                        record_digest = hashlib.sha256(payload.encode()).hexdigest()
-                        manifest.append([str(key), record_digest])
-                        cursor = journal.db.execute("INSERT OR IGNORE INTO capture_records VALUES (?,?,?,?,?,?,?,?)",
-                                                    (*identity, str(key), record_digest, payload, int(redacted)))
-                        new_records += cursor.rowcount
+                        manifest.append([key, record_digest])
+                        inserted = journal.db.execute("INSERT OR IGNORE INTO capture_records VALUES (?,?,?,?,?,?,?,?)",
+                                                      (*identity, key, record_digest, payload, int(redacted)))
+                        new_records += inserted.rowcount
                     if not conflict and details["status"] != "unchanged" and not any("Normalization failed" in gap for gap in gaps):
                         old_ids = {r[0] for r in journal.db.execute("""SELECT e.id FROM events e
                             WHERE e.project=? AND e.source=? AND e.session_id=? AND (
@@ -612,20 +727,25 @@ def synchronize(journal, project, home, source="auto", selected=None):
                 report["new_events"] += new_events
                 report["conversations"].append(details)
                 if not conflict:
-                    captured_sessions.append(captured)
+                    captured_sessions.append(captured if reread or selected else {**captured, "events": []})
                     if is_codex_db:
                         state_threads.add(sid)
-                    if is_codex_db and captured["events"]:
+                    if is_codex_db and full_events:
                         sqlite_threads.add(sid)
-                        signatures = Counter(event_signature(e) for e in captured["events"])
-                        sqlite_signatures[sid] = (hashlib.sha256(json.dumps([e["id"] for e in captured["events"]]).encode()).hexdigest(), signatures,
-                                                  {(event_signature(e), e["ordinal"]) for e in captured["events"]})
+                        signatures = Counter(event_signature(e) for e in full_events)
+                        sqlite_signatures[sid] = (hashlib.sha256(json.dumps([e["id"] for e in full_events]).encode()).hexdigest(), signatures,
+                                                  {(event_signature(e), e["ordinal"]) for e in full_events})
                     if is_codex_db and metadata.get("projected_rollout_ordinal") is not None and metadata.get("rollout_path"):
-                        signatures = Counter(event_signature(e) for e in captured["events"])
-                        overlap_digest = hashlib.sha256(json.dumps([e["id"] for e in captured["events"]]).encode()).hexdigest()
+                        signatures = Counter(event_signature(e) for e in full_events)
+                        overlap_digest = hashlib.sha256(json.dumps([e["id"] for e in full_events]).encode()).hexdigest()
                         projected[(sid, workspace_path(metadata["rollout_path"]))] = metadata["projected_rollout_ordinal"], signatures, overlap_digest
+            if kind == "cursor" and not selected and known_project and workspace_path(known_project) == project and path.suffix != ".jsonl":
+                journal.db.execute("INSERT OR REPLACE INTO journal_meta VALUES (?,?)", (cursor_key, cursor_stamp))
         except (OSError, ValueError, TypeError, AttributeError, KeyError, sqlite3.Error) as exc:
             report["gaps"].append({"source": kind, "path": str(path), "reason": f"Capture failed: {type(exc).__name__}: {exc}"})
+    if codex_stamp and not codex_skip and not any(
+            gap.get("source") == "codex" and "Capture failed" in gap.get("reason", "") for gap in report["gaps"] if isinstance(gap, dict)):
+        journal.db.execute("INSERT OR REPLACE INTO journal_meta VALUES (?,?)", (codex_key, codex_stamp))
     for row in journal.db.execute("SELECT * FROM capture_state WHERE project=?", (str(project),)):
         identity = tuple(row[key] for key in ("project", "source", "session_id", "location"))
         if row["source"] in kinds and not selected and identity not in seen:
@@ -648,7 +768,7 @@ def synchronize(journal, project, home, source="auto", selected=None):
     captured_sessions = list(grouped.values())
     for captured in captured_sessions:
         captured["events"].sort(key=lambda e: (e["metadata"].get("capture_sequence", 0), e["timestamp"], e["metadata"]["source_path"], e["ordinal"]))
-    report["conversations_captured"] = len(captured_sessions)
+    report["conversations_captured"] = len(skipped_chats | {(c["source"], c["id"]) for c in captured_sessions})
     safe_report = sanitize_value(report)
     journal.db.execute("INSERT OR REPLACE INTO capture_reports VALUES (?,?)", (str(project), json.dumps(safe_report)))
     journal.db.commit()

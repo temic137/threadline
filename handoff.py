@@ -703,7 +703,7 @@ def main(argv: list[str] | None = None) -> int:
         from handoff_capture import synchronize
         journal = Journal(db_path)
         try:
-            captures, coverage = synchronize(journal, project, home, args.source, args.session)
+            captures, coverage = synchronize(journal, project, home, args.source, args.session, reread=True)
             from handoff_decisions import track
             captured = captures[0] if len(captures) == 1 else None
             project_context = journal.project_context(project)

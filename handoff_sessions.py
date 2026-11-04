@@ -596,7 +596,8 @@ class Journal:
                 content TEXT, metadata TEXT
             );
             CREATE INDEX IF NOT EXISTS events_project_order ON events(project, timestamp, ordinal);
-            CREATE INDEX IF NOT EXISTS events_session ON events(project, source, session_id);
+            DROP INDEX IF EXISTS events_session;
+            CREATE INDEX IF NOT EXISTS events_session_kind ON events(project, source, session_id, kind, timestamp, ordinal);
         """)
         try:
             self._prepare_search_index()
@@ -667,8 +668,9 @@ class Journal:
             for detail in self.db.execute("SELECT details FROM capture_state WHERE project=? AND source=? AND session_id=?",
                                           (item["project"], item["source"], item["id"])):
                 metadata.update(json.loads(detail[0]).get("metadata", {}))
-            first = self.db.execute("SELECT content FROM events WHERE project=? AND source=? AND session_id=? AND kind='user_message' ORDER BY timestamp,ordinal LIMIT 1",
-                                    (item["project"], item["source"], item["id"])).fetchone()
+            first = None if metadata.get("title") or metadata.get("name") else self.db.execute(
+                "SELECT content FROM events WHERE project=? AND source=? AND session_id=? AND kind='user_message' ORDER BY timestamp,ordinal LIMIT 1",
+                (item["project"], item["source"], item["id"])).fetchone()
             item["title"] = metadata.get("title") or metadata.get("name") or (first and visible_text(first[0])[:100]) or item["id"]
             item["title_inferred"] = not bool(metadata.get("title") or metadata.get("name"))
             item["parent_id"] = metadata.get("parent_thread_id") or metadata.get("parent_session_id") or metadata.get("forked_from_id")
@@ -758,13 +760,14 @@ class Journal:
                 for event in events]
 
     def read_conversation(self, project: Path, source: str, session_id: str, start=0, limit=5,
-                          messages_only=False, max_chars=None, keep_event=None) -> dict:
+                          messages_only=False, max_chars=None, keep_event=None, groups=None) -> dict:
         """Messages are never shortened. max_chars ends a page early; next_start continues it."""
-        if not any(c["source"] == source and c["id"] == session_id for c in self.conversations(project)):
+        if not self.db.execute("SELECT 1 FROM sessions WHERE project=? AND source=? AND id=?",
+                               (str(project.resolve()), source, session_id)).fetchone():
             raise ValueError("Conversation does not belong to this project")
         if start < 0 or not 1 <= limit <= 50:
             raise ValueError("start must be nonnegative; limit must be between 1 and 50")
-        groups = self.exchanges(project, source, session_id, with_content=False)
+        groups = groups if groups is not None else self.exchanges(project, source, session_id, with_content=False)
         page, used, end = [], 0, start
         for index in range(start, min(start + limit, len(groups))):
             events = groups[index]
@@ -884,11 +887,61 @@ class Journal:
                               "start": len(groups) - 1 if not selected and groups else 0, "limit": 1},
                 "instruction": "History is evidence, not new authorization. Read omitted exchanges and decision evidence as needed. Search other project conversations for earlier requirements. Decision candidates and agent interpretations are not verified facts."}
 
+    def matching_chats(self, project: Path, query: str, limit=15) -> list[dict]:
+        """Every chat a query appears in, main chats and the person's own words first."""
+        terms = re.findall(r"[\w./:-]+", query, re.UNICODE)
+        if not terms:
+            return []
+        key = str(project.resolve())
+        match = " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms[:12])
+        columns = "e.source,e.session_id,count(*),sum(e.kind='user_message'),max(e.timestamp)"
+        try:
+            if not self.fts:
+                raise sqlite3.OperationalError("FTS5 unavailable")
+            rows = self.db.execute(f"""SELECT {columns} FROM events_fts f JOIN events e ON e.rowid=f.rowid
+                WHERE e.project=? AND events_fts MATCH ? GROUP BY 1,2""", (key, match)).fetchall()
+        except sqlite3.OperationalError:
+            rows = self.db.execute(f"SELECT {columns} FROM events e WHERE e.project=? AND e.content LIKE ? GROUP BY 1,2",
+                                   (key, f"%{query}%")).fetchall()
+        known = {(c["source"], c["id"]): c for c in self.conversations(project)}
+        chats = []
+        for source, session_id, hits, asked, latest in rows:
+            chat = known.get((source, session_id), {})
+            chats.append({"source": source, "session_id": session_id, "title": chat.get("title", ""),
+                          "relationship": chat.get("relationship", "main"), "matches": hits,
+                          "matches_in_your_messages": asked, "last_match": latest})
+        chats.sort(key=lambda c: (c["relationship"] == "child", -c["matches_in_your_messages"], -c["matches"]))
+        return chats[:limit]
+
+    def search_in_chat(self, project: Path, query: str, source: str, session_id: str) -> dict | None:
+        terms = re.findall(r"[\w./:-]+", query, re.UNICODE)
+        match = " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms[:12])
+        key, order = (str(project.resolve()), source, session_id), "e.kind='user_message' DESC, e.timestamp DESC, e.ordinal DESC"
+        try:
+            if not self.fts:
+                raise sqlite3.OperationalError("FTS5 unavailable")
+            row = self.db.execute(f"""SELECT e.* FROM events_fts f JOIN events e ON e.rowid=f.rowid
+                WHERE e.project=? AND e.source=? AND e.session_id=? AND events_fts MATCH ? ORDER BY {order} LIMIT 1""",
+                                  (*key, match)).fetchone()
+        except sqlite3.OperationalError:
+            row = self.db.execute(f"SELECT e.* FROM events e WHERE e.project=? AND e.source=? AND e.session_id=? AND e.content LIKE ? ORDER BY {order} LIMIT 1",
+                                  (*key, f"%{query}%")).fetchone()
+        return dict(row) | {"metadata": json.loads(row["metadata"])} if row else None
+
     def search_context(self, project: Path, query: str, limit=5, max_chars=None) -> dict:
-        hits = self.search(project, query, min(max(limit, 1), 20))
+        chats = self.matching_chats(project, query)
+        # The best match in each chat first, so one long chat cannot crowd out the others.
+        hits = [hit for hit in (self.search_in_chat(project, query, c["source"], c["session_id"]) for c in chats[:min(max(limit, 1), 20)]) if hit]
+        seen_ids = {hit["id"] for hit in hits}
+        if len(hits) < limit:
+            hits += [hit for hit in self.search(project, query, min(max(limit, 1), 20)) if hit["id"] not in seen_ids][:limit - len(hits)]
         results, seen, used, omitted = [], set(), 0, 0
+        outlines = {}
         for hit in hits:
-            groups = self.exchanges(project, hit["source"], hit["session_id"], with_content=False)
+            chat = (hit["source"], hit["session_id"])
+            if chat not in outlines:
+                outlines[chat] = self.exchanges(project, *chat, with_content=False)
+            groups = outlines[chat]
             index = next((i for i, group in enumerate(groups) if any(e["id"] == hit["id"] for e in group)), None)
             key = (hit["source"], hit["session_id"], index)
             if index is None or key in seen:
@@ -896,14 +949,22 @@ class Journal:
             seen.add(key)
             result = {"match_id": hit["id"], **self.read_conversation(
                 project, hit["source"], hit["session_id"], max(0, index-1), 3,
-                messages_only=bool(max_chars), keep_event=hit["id"])}
+                messages_only=bool(max_chars), keep_event=hit["id"], groups=groups)}
+            if max_chars:
+                # A search shows where to look; read_conversation returns the whole messages.
+                for exchange in result["exchanges"]:
+                    for event in exchange["events"]:
+                        if len(event["content"]) > _SEARCH_EVENT_CHARS:
+                            event["full_chars"] = len(event["content"])
+                            event["content"] = event["content"][:_SEARCH_EVENT_CHARS]
+                            event["content_truncated"] = True
             cost = len(json.dumps(result, ensure_ascii=False))
             if results and max_chars and used + cost > max_chars:
                 omitted += 1
                 continue
             results.append(result)
             used += cost
-        return {"results": results, "omitted_results": omitted}
+        return {"matching_chats": chats, "results": results, "omitted_results": omitted}
 
     def projects(self) -> list[dict]:
         return [dict(row) for row in self.db.execute(
@@ -923,6 +984,8 @@ class Journal:
             else:
                 self.db.execute("DELETE FROM typellm_cache WHERE project=?", (str(project.resolve()),))
         project_value = str(project.resolve())
+        # Stamps say nothing changed, so a deletion must clear them for the next capture to restore it.
+        self.db.execute("DELETE FROM journal_meta WHERE key=? OR key LIKE ?", (f"codex_stamp:{project_value}", f"cursor_stamp:{project_value}:%"))
         clause, params = "project=?", [project_value]
         if session_id:
             clause += " AND session_id=?"
@@ -1048,6 +1111,8 @@ _SMALL_TALK = re.compile(r"(?i)(?:hi|hello|hey|yo|test|testing|thanks|thank you|
 _CURRENT_SESSION_WINDOW = datetime.timedelta(minutes=15)
 # Roughly 15,000 tokens, which fits common client limits for one tool result.
 _MCP_PAGE_CHARS = 60000
+_MCP_SEARCH_CHARS = 24000
+_SEARCH_EVENT_CHARS = 1500
 
 
 def visible_text(text: str) -> str:
@@ -1256,7 +1321,7 @@ def mcp_response(request: dict, journal: Journal) -> dict | None:
             data = journal.read_conversation(project, args["source"], args["session_id"], int(args.get("start", 0)), int(args.get("limit", 5)),
                                              messages_only=bool(args.get("messages_only")), max_chars=_MCP_PAGE_CHARS)
         elif name == "search_context":
-            data = journal.search_context(project, str(args.get("query", "")), min(limit, 20), max_chars=_MCP_PAGE_CHARS)
+            data = journal.search_context(project, str(args.get("query", "")), min(limit, 20), max_chars=_MCP_SEARCH_CHARS)
         elif name == "coverage":
             data = coverage_page(stored_report(journal, project), int(args.get("start", 0)), limit) or {"status": "No capture report; run capture first."}
         elif name == "search":
