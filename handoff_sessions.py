@@ -731,6 +731,7 @@ class Journal:
             if not groups or event["kind"] == "user_message":
                 groups.append([])
             groups[-1].append(event)
+        groups = self._join_requests_replayed_across_files(groups)
         # User-message boundaries are inferred, not native turn IDs. Join boundaries
         # crossed by a tool call/result so interrupted exchanges remain together.
         calls, spans = {}, []
@@ -749,6 +750,31 @@ class Journal:
             else:
                 merged.append(group)
         return merged
+
+    def _join_requests_replayed_across_files(self, groups: list[list[dict]]) -> list[list[dict]]:
+        """A new file can start by repeating the request in progress when the last file ended.
+        Only that repeat is joined: the same words sent later in a file are a new request."""
+
+        def file_of(event):
+            return event["metadata"].get("overlay_of") or event["metadata"].get("source_path", "")
+
+        def text_of_event(event):
+            if "content" in event:
+                return event["content"]
+            row = self.db.execute("SELECT content FROM events WHERE id=?", (event["id"],)).fetchone()
+            return row[0] if row else ""
+
+        joined = []
+        for group in groups:
+            request = group[0] if group[0]["kind"] == "user_message" else None
+            earlier = joined[-1][0] if joined and joined[-1][0]["kind"] == "user_message" else None
+            if (request and earlier and file_of(joined[-1][-1]) != file_of(request)
+                    and request.get("content_chars") == earlier.get("content_chars")
+                    and text_of_event(request) == text_of_event(earlier)):
+                joined[-1].extend(group[1:])
+            else:
+                joined.append(group)
+        return joined
 
     def hydrate(self, events: list[dict]) -> list[dict]:
         """Load content for events from an outline, keeping their order."""
@@ -948,11 +974,14 @@ class Journal:
                 continue
             seen.add(key)
             result = {"match_id": hit["id"], **self.read_conversation(
-                project, hit["source"], hit["session_id"], max(0, index-1), 3,
+                project, hit["source"], hit["session_id"], index if max_chars else max(0, index-1), 1 if max_chars else 3,
                 messages_only=bool(max_chars), keep_event=hit["id"], groups=groups)}
             if max_chars:
                 # A search shows where to look; read_conversation returns the whole messages.
                 for exchange in result["exchanges"]:
+                    replies = [e for e in exchange["events"] if e["kind"] == "assistant_message"]
+                    exchange["events"] = [e for e in exchange["events"] if e["kind"] != "assistant_message"
+                                          or e["id"] == hit["id"] or e is replies[-1]]
                     for event in exchange["events"]:
                         if len(event["content"]) > _SEARCH_EVENT_CHARS:
                             event["full_chars"] = len(event["content"])

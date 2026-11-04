@@ -615,17 +615,18 @@ def synchronize(journal, project, home, source="auto", selected=None, reread=Fal
                         gaps.append("Some JSONL records before the SQLite projection boundary have no exact normalized match; retained rather than discarded. Duplicate tool activity or source-order differences may remain.")
                 elif compressed and sid in sqlite_signatures:
                     # The database can hold any one segment of a thread, whatever rollout_path
-                    # says. Later segments replay some messages, so only messages on the same
-                    # rollout lines identify that segment; other segments stand alone.
-                    _, signatures, positions = sqlite_signatures[sid]
+                    # says. Segments follow each other in time, so the same words in another
+                    # segment are a new message; only the same line or second is the same message.
+                    _, signatures, positions, moments = sqlite_signatures[sid]
                     matches = Counter(signatures)
                     retained, shared, aligned = [], 0, 0
                     for event in captured["events"]:
                         signature = event_signature({**event, "content": redact(str(event["content"]))})
-                        if matches[signature]:
+                        on_line = (signature, event["ordinal"] * 10) in positions
+                        if matches[signature] and (on_line or (signature, str(event["timestamp"])[:19]) in moments):
                             matches[signature] -= 1
                             shared += 1
-                            aligned += (signature, event["ordinal"] * 10) in positions
+                            aligned += on_line
                         else:
                             retained.append(event)
                     if aligned and aligned * 2 >= shared:
@@ -734,7 +735,8 @@ def synchronize(journal, project, home, source="auto", selected=None, reread=Fal
                         sqlite_threads.add(sid)
                         signatures = Counter(event_signature(e) for e in full_events)
                         sqlite_signatures[sid] = (hashlib.sha256(json.dumps([e["id"] for e in full_events]).encode()).hexdigest(), signatures,
-                                                  {(event_signature(e), e["ordinal"]) for e in full_events})
+                                                  {(event_signature(e), e["ordinal"]) for e in full_events},
+                                                  {(event_signature(e), str(e["timestamp"])[:19]) for e in full_events})
                     if is_codex_db and metadata.get("projected_rollout_ordinal") is not None and metadata.get("rollout_path"):
                         signatures = Counter(event_signature(e) for e in full_events)
                         overlap_digest = hashlib.sha256(json.dumps([e["id"] for e in full_events]).encode()).hexdigest()

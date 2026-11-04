@@ -252,3 +252,44 @@ def test_search_results_are_short_and_point_to_the_whole_message(tmp_path):
         assert len(whole["content"]) == event["full_chars"]
     finally:
         journal.close()
+
+
+def test_a_repeated_short_request_in_a_later_file_keeps_its_own_work(tmp_path):
+    """The database holds the first file only; the same words later are a new request."""
+    home, project = tmp_path / "home", tmp_path / "project"
+    project.mkdir()
+    folder = home / ".codex" / "sessions" / "2026" / "01" / "01"
+    folder.mkdir(parents=True)
+    later = folder / f"rollout-2026-01-02T00-00-00-{MAIN}_55555555-5555-4555-8555-555555555555.jsonl"
+    lines = [{"type": "session_meta", "payload": {"id": MAIN, "cwd": str(project)}}, user("new topic"), agent("sure"), user("ok do that"), call("c9", "ls"), output("c9", "listing"), agent("done")]
+    later.write_text("".join(json.dumps({"timestamp": "2026-12-01T00:00:00Z", **row}) + chr(10) for row in lines), encoding="utf-8")
+    earlier = folder / f"rollout-2026-01-01T00-00-00-{MAIN}.jsonl.zst"
+    import zstandard
+    old_lines = [{"type": "session_meta", "payload": {"id": MAIN, "cwd": str(project)}}, user("ok do that"), agent("an old reply")]
+    earlier.write_bytes(zstandard.ZstdCompressor().compress("".join(json.dumps({"timestamp": "2026-01-01T00:00:00Z", **row}) + chr(10) for row in old_lines).encode()))
+    _, history = databases(home, project, MAIN, str(earlier))
+    from test_compressed_history import item as compressed_item
+    compressed_item(history, MAIN, 1, "userMessage", content=[{"type": "text", "text": "ok do that"}])
+    compressed_item(history, MAIN, 2, "agentMessage", text="an old reply")
+    journal = Journal(tmp_path / "j.db")
+    try:
+        synchronize(journal, project, home, "codex")
+        groups = [[e["content"] for e in group] for group in journal.exchanges(project, "codex", MAIN)]
+        joined = [" | ".join(group) for group in groups]
+        assert sum(group.count("ok do that") for group in groups) == 2, joined
+        assert any("ok do that" in group and "ls" in group and "listing" in group for group in groups), joined
+    finally:
+        journal.close()
+
+
+def test_the_same_words_later_in_one_file_stay_separate_requests(tmp_path):
+    home, project = capture_setup(tmp_path, [user("continue"), call("c1", "ls"), output("c1", "one"), agent("first"),
+                                             user("something else"), agent("second"),
+                                             user("continue"), call("c2", "pwd"), output("c2", "two"), agent("third")])
+    journal = Journal(tmp_path / "j.db")
+    try:
+        synchronize(journal, project, home, "codex")
+        groups = [[e["content"] for e in group] for group in journal.exchanges(project, "codex", MAIN)]
+        assert [group[0] for group in groups] == ["continue", "something else", "continue"]
+    finally:
+        journal.close()
