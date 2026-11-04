@@ -362,6 +362,8 @@ def cursor_conversations(path, project):
 
 
 # Source files stay on disk, so the journal keeps what resume and search need, not a second copy.
+# Raise this when the order of saved Codex events changes, so saved chats are read again.
+CODEX_ORDER_VERSION = "v2"
 RAW_RECORD_LIMIT = 2000
 TOOL_ARGUMENT_LIMIT = 2000
 TOOL_CONTENT_HEAD = 6000
@@ -399,8 +401,30 @@ def codex_thread_homes(state_path):
     return homes
 
 
+def moments_of(events):
+    """Database lines by message and second, to recognise the same message in a rollout file."""
+    moments = {}
+    for event in events:
+        moments.setdefault((event_signature(event), str(event["timestamp"])[:19]), []).append(event["ordinal"])
+    return moments
+
+
+def rollout_offset(events, signatures, counts, positions, moments):
+    """How far this file's lines sit from the database's, or None if the database wasn't read from this file.
+    A fork's database lines continue from its parent's. Times suggest the distance, but only some
+    are recorded exactly, so the lines decide: most database messages must sit at that distance."""
+    distances = Counter()
+    for event, signature in zip(events, signatures):
+        distances.update({ordinal // 10 - event["ordinal"] for ordinal in moments.get((signature, str(event["timestamp"])[:19]), ())})
+    for offset in dict.fromkeys([0, *(distance for distance, _ in distances.most_common(3))]):
+        aligned = sum((signature, (event["ordinal"] + offset) * 10) in positions for event, signature in zip(events, signatures))
+        if aligned * 2 >= sum(counts.values()):
+            return offset
+    return None
+
+
 def codex_source_stamp(candidates, state_path, history_path):
-    parts = [str(REDACTION_VERSION)]
+    parts = [str(REDACTION_VERSION), CODEX_ORDER_VERSION]
     for path in (state_path, history_path):
         if path:
             wal = Path(str(path) + "-wal")
@@ -570,7 +594,7 @@ def synchronize(journal, project, home, source="auto", selected=None, reread=Fal
                     identity = (str(project), kind, selection_id, str(path.resolve()))
                     stat = path.stat()
                     boundary = projected.get((sid, workspace_path(path.with_suffix("") if compressed else path)))
-                    stamp = f"rollout-v1:{REDACTION_VERSION}:{stat.st_size}:{stat.st_mtime_ns}:{boundary[2] if boundary else sqlite_signatures.get(sid, ('',))[0]}"
+                    stamp = f"rollout-{CODEX_ORDER_VERSION}:{REDACTION_VERSION}:{stat.st_size}:{stat.st_mtime_ns}:{boundary[2] if boundary else sqlite_signatures.get(sid, ('',))[0]}"
                     row = journal.db.execute("SELECT details FROM capture_state WHERE project=? AND source=? AND session_id=? AND location=?", identity).fetchone()
                     if not reread and row and json.loads(row[0]).get("source_stamp") == stamp:
                         details = json.loads(row[0])
@@ -588,6 +612,12 @@ def synchronize(journal, project, home, source="auto", selected=None, reread=Fal
                     continue
                 location = str(path.resolve())
                 projection = projected.get((sid, workspace_path(path.with_suffix("") if compressed else path))) if kind == "codex" and not is_codex_db else None
+                if compressed and sid in sqlite_signatures:
+                    event_signatures = [event_signature({**e, "content": redact(str(e["content"]))}) for e in captured["events"]]
+                    offset = rollout_offset(captured["events"], event_signatures, *sqlite_signatures[sid][1:])
+                    if offset != 0:
+                        # The database names this file, but its contents came from another one.
+                        projection = None
                 if projection is not None:
                     cursor, matches, overlap_digest = projection
                     original_count = len(captured["events"])
@@ -619,20 +649,18 @@ def synchronize(journal, project, home, source="auto", selected=None, reread=Fal
                     # segment are a new message; only the same line or second is the same message.
                     _, signatures, positions, moments = sqlite_signatures[sid]
                     matches = Counter(signatures)
-                    retained, shared, aligned = [], 0, 0
-                    for event in captured["events"]:
-                        signature = event_signature({**event, "content": redact(str(event["content"]))})
-                        on_line = (signature, event["ordinal"] * 10) in positions
-                        if matches[signature] and (on_line or (signature, str(event["timestamp"])[:19]) in moments):
+                    retained = []
+                    for event, signature in zip(captured["events"], event_signatures):
+                        same_line = offset is not None and (signature, (event["ordinal"] + offset) * 10) in positions
+                        if matches[signature] and (same_line or (signature, str(event["timestamp"])[:19]) in moments):
                             matches[signature] -= 1
-                            shared += 1
-                            aligned += on_line
                         else:
                             retained.append(event)
-                    if aligned and aligned * 2 >= shared:
+                    # Only the file the database was read from merges into its messages.
+                    if offset is not None:
                         retained = [e for e in retained if e["kind"] != "file_change"]
                         for event in retained:
-                            event["metadata"].update(rollout_line=event["ordinal"], overlay_of=str(state_path.resolve()))
+                            event["metadata"].update(rollout_line=event["ordinal"] + offset, overlay_of=str(state_path.resolve()))
                     captured["events"] = retained
                 elif kind == "codex" and not is_codex_db and sid in sqlite_threads:
                     gaps.append("SQLite and this continuation segment overlap without a confirmed projection boundary; both retained, duplicate exchanges may appear.")
@@ -717,6 +745,9 @@ def synchronize(journal, project, home, source="auto", selected=None, reread=Fal
                         for event_id in old_ids - new_ids:
                             journal.db.execute("DELETE FROM events WHERE id=?", (event_id,))
                         journal.import_session(captured, commit=False)
+                        # An event read before keeps its id, but may now belong in a different place.
+                        journal.db.executemany("UPDATE events SET metadata=? WHERE id=?",
+                                               [(json.dumps(e["metadata"], ensure_ascii=False), e["id"]) for e in captured["events"]])
                         journal.db.execute("DELETE FROM capture_event_links WHERE project=? AND source=? AND session_id=? AND location=?", identity)
                         journal.db.executemany("INSERT OR IGNORE INTO capture_event_links VALUES (?,?,?,?,?)",
                                                [(*identity, event_id) for event_id in new_ids])
@@ -736,7 +767,7 @@ def synchronize(journal, project, home, source="auto", selected=None, reread=Fal
                         signatures = Counter(event_signature(e) for e in full_events)
                         sqlite_signatures[sid] = (hashlib.sha256(json.dumps([e["id"] for e in full_events]).encode()).hexdigest(), signatures,
                                                   {(event_signature(e), e["ordinal"]) for e in full_events},
-                                                  {(event_signature(e), str(e["timestamp"])[:19]) for e in full_events})
+                                                  moments_of(full_events))
                     if is_codex_db and metadata.get("projected_rollout_ordinal") is not None and metadata.get("rollout_path"):
                         signatures = Counter(event_signature(e) for e in full_events)
                         overlap_digest = hashlib.sha256(json.dumps([e["id"] for e in full_events]).encode()).hexdigest()

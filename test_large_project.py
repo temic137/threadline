@@ -293,3 +293,117 @@ def test_the_same_words_later_in_one_file_stay_separate_requests(tmp_path):
         assert [group[0] for group in groups] == ["continue", "something else", "continue"]
     finally:
         journal.close()
+
+
+def compressed_rollout(folder, name, lines):
+    import zstandard
+    text = "".join(json.dumps({"timestamp": stamp, **row}) + chr(10) for stamp, row in lines)
+    (folder / name).write_bytes(zstandard.ZstdCompressor().compress(text.encode()))
+    return folder / name
+
+
+def rollout_folder(tmp_path):
+    home, project = tmp_path / "home", tmp_path / "project"
+    project.mkdir()
+    folder = home / ".codex" / "sessions" / "2026" / "01" / "01"
+    folder.mkdir(parents=True)
+    return home, project, folder
+
+
+def test_one_chance_match_does_not_pull_a_later_file_among_the_database_messages(tmp_path):
+    """A later file was once shuffled in among earlier messages because one line happened to match."""
+    from test_codex_sqlite import item
+    home, project, folder = rollout_folder(tmp_path)
+    january, february = "2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z"
+    meta = {"type": "session_meta", "payload": {"id": MAIN, "cwd": str(project)}}
+    first = compressed_rollout(folder, f"rollout-2026-01-01T00-00-00-{MAIN}.jsonl.zst", [(january, row) for row in (
+        meta, user("first request"), call("c1", "one"), output("c1", "a"), agent("first reply"),
+        user("second request"), call("c2", "two"), output("c2", "b"), agent("second reply"))])
+    # The later file repeats "first reply" on the same line as the database, by chance.
+    later = compressed_rollout(folder, f"rollout-2026-02-01T00-00-00-{MAIN}_55555555-5555-4555-8555-555555555555.jsonl.zst", [(february, row) for row in (
+        meta, user("later one"), call("c3", "three"), output("c3", "c"), agent("first reply"),
+        user("later two"), call("c4", "four"), output("c4", "d"), agent("done"))])
+    # Codex names the newest file here, although the database was read from the first one.
+    _, history = databases(home, project, MAIN, str(later)[:-4])
+    item(history, MAIN, 1, "userMessage", content=[{"type": "text", "text": "first request"}])
+    item(history, MAIN, 4, "agentMessage", text="first reply")
+    item(history, MAIN, 5, "userMessage", content=[{"type": "text", "text": "second request"}])
+    item(history, MAIN, 8, "agentMessage", text="second reply")
+    with closing(sqlite3.connect(history)) as db, db:
+        db.execute("UPDATE thread_items SET created_at_ms=1767225600000")  # January, like its file
+        db.execute("INSERT INTO thread_history_projection_state VALUES (?,?,?)", (MAIN, 9, 0))
+    journal = Journal(tmp_path / "j.db")
+    try:
+        synchronize(journal, project, home, "codex")
+        groups = journal.exchanges(project, "codex", MAIN)
+        requests = [e["content"] for group in groups for e in group if e["kind"] == "user_message"]
+        assert requests == ["first request", "second request", "later one", "later two"]
+        kept = {group[0]["content"]: [e["content"] for e in group if e["kind"] == "tool_call"] for group in groups}
+        assert "three" in str(kept["later one"]) and "four" in str(kept["later two"]), kept
+        replies = [e["content"] for group in groups for e in group if e["kind"] == "assistant_message"]
+        assert replies.count("first reply") == 2, replies  # the repeat in the later file is its own reply
+    finally:
+        journal.close()
+
+
+def test_a_forks_work_stays_under_each_request_when_its_database_lines_are_offset(tmp_path):
+    """A fork's database lines continue from its parent's, so they never equal this file's lines."""
+    from test_codex_sqlite import item
+    home, project, folder = rollout_folder(tmp_path)
+    one, two = "2026-01-01T10:00:00Z", "2026-01-03T10:00:00Z"
+    first = compressed_rollout(folder, f"rollout-2026-01-01T00-00-00-{MAIN}.jsonl.zst", [
+        (one, {"type": "session_meta", "payload": {"id": MAIN, "cwd": str(project)}}), (one, user("first request")),
+        (one, call("c1", "one")), (one, output("c1", "a")), (one, agent("first reply")),
+        (two, user("second request")), (two, call("c2", "two")), (two, output("c2", "b")), (two, agent("second reply"))])
+    _, history = databases(home, project, MAIN, str(first))
+    item(history, MAIN, 1001, "userMessage", content=[{"type": "text", "text": "first request"}])
+    item(history, MAIN, 1004, "agentMessage", text="first reply")
+    item(history, MAIN, 1005, "userMessage", content=[{"type": "text", "text": "second request"}])
+    item(history, MAIN, 1008, "agentMessage", text="second reply")
+    with closing(sqlite3.connect(history)) as db, db:
+        db.execute("UPDATE thread_items SET created_at_ms=1767261600000")
+        db.execute("UPDATE thread_items SET created_at_ms=1767261600000+5000 WHERE rollout_ordinal IN (1004,1005,1008)")
+    journal = Journal(tmp_path / "j.db")
+    try:
+        synchronize(journal, project, home, "codex")
+        groups = journal.exchanges(project, "codex", MAIN)
+        kept = {group[0]["content"]: [e["content"] for e in group if e["kind"] == "tool_call"] for group in groups}
+        assert "one" in str(kept["first request"]) and "two" not in str(kept["first request"]), kept
+        assert "two" in str(kept["second request"]), kept
+        replies = [e["content"] for group in groups for e in group if e["kind"] == "assistant_message"]
+        assert replies == ["first reply", "second reply"], replies
+    finally:
+        journal.close()
+
+
+def test_chats_saved_in_the_wrong_order_are_read_again_after_an_upgrade(tmp_path, monkeypatch):
+    home, project = capture_setup(tmp_path, [user("go"), agent("done")])
+    journal = Journal(tmp_path / "j.db")
+    try:
+        synchronize(journal, project, home, "codex")
+        calls = []
+        real = handoff_capture.jsonl_capture
+        monkeypatch.setattr(handoff_capture, "jsonl_capture", lambda *a: calls.append(a) or real(*a))
+        synchronize(journal, project, home, "codex")
+        assert not calls
+        journal.db.execute("""UPDATE events SET metadata=json_set(metadata, '$.rollout_line', 99, '$.overlay_of', 'wrong')""")
+        journal.db.execute("UPDATE capture_state SET digest='older', details=json_set(details, '$.source_stamp', 'older')")
+        journal.db.commit()
+        monkeypatch.setattr(handoff_capture, "CODEX_ORDER_VERSION", "test-next")
+        synchronize(journal, project, home, "codex")
+        assert calls
+        assert not journal.db.execute("SELECT count(*) FROM events WHERE metadata LIKE '%overlay_of%'").fetchone()[0]
+    finally:
+        journal.close()
+
+
+def test_search_with_long_titles_stays_inside_its_limit(tmp_path):
+    long_title = "needle " + "pasted document " * 500
+    home, project = capture_setup(tmp_path, [user(long_title), agent("needle reply")])
+    journal = Journal(tmp_path / "j.db")
+    try:
+        synchronize(journal, project, home, "codex")
+        found = journal.search_context(project, "needle", 20, max_chars=4000)
+        assert found["results"] and len(json.dumps(found["matching_chats"])) < 1000
+    finally:
+        journal.close()

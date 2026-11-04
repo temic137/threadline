@@ -961,7 +961,10 @@ class Journal:
         seen_ids = {hit["id"] for hit in hits}
         if len(hits) < limit:
             hits += [hit for hit in self.search(project, query, min(max(limit, 1), 20)) if hit["id"] not in seen_ids][:limit - len(hits)]
-        results, seen, used, omitted = [], set(), 0, 0
+        if max_chars:
+            # Titles can be whole pasted documents, and the list counts towards the limit.
+            chats = [{**chat, "title": chat["title"][:_SEARCH_TITLE_CHARS]} for chat in chats]
+        results, seen, used, omitted = [], set(), len(json.dumps(chats, ensure_ascii=False)) if max_chars else 0, 0
         outlines = {}
         for hit in hits:
             chat = (hit["source"], hit["session_id"])
@@ -1141,6 +1144,7 @@ _CURRENT_SESSION_WINDOW = datetime.timedelta(minutes=15)
 # Roughly 15,000 tokens, which fits common client limits for one tool result.
 _MCP_PAGE_CHARS = 60000
 _MCP_SEARCH_CHARS = 24000
+_SEARCH_TITLE_CHARS = 120
 _SEARCH_EVENT_CHARS = 1500
 
 
