@@ -199,6 +199,37 @@ def stored_report(journal, project):
     return json.loads(row[0]) if row else None
 
 
+def summarize_report(report, gap_limit=5):
+    """A capture report can reach megabytes; agents need its totals and its distinct gaps."""
+    if not report:
+        return None
+    gaps = {}
+    for gap in report.get("gaps", []):
+        key = (gap.get("source"), gap.get("reason"))
+        group = gaps.setdefault(key, {"source": key[0], "reason": str(key[1])[:160], "count": 0, "example": gap.get("path")})
+        group["count"] += 1
+    conversations = report.get("conversations", [])
+    fields = ("project", "captured_at", "scope", "sources", "new_records", "new_events",
+              "source_files_captured", "conversations_captured")
+    return {**{key: report.get(key) for key in fields},
+            "conversation_statuses": dict(Counter(item.get("status") for item in conversations)),
+            "conversation_gaps": sum(len(item.get("gaps", [])) for item in conversations),
+            "gaps_total": len(report.get("gaps", [])),
+            "gaps": sorted(gaps.values(), key=lambda group: -group["count"])[:gap_limit]}
+
+
+def coverage_page(report, start=0, limit=20):
+    """Page per-conversation details without the source metadata kept in the full report."""
+    if not report:
+        return None
+    if start < 0:
+        raise ValueError("start must be nonnegative")
+    conversations = report.get("conversations", [])
+    rows = [{key: value for key, value in item.items() if key != "metadata"} for item in conversations[start:start+limit]]
+    return {**summarize_report(report, gap_limit=50), "conversations": rows,
+            "next_start": start + limit if start + limit < len(conversations) else None}
+
+
 def record_types(kind, rows):
     """Describe archived record types without claiming their fields were normalized."""
     counts = Counter()

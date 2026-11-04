@@ -134,12 +134,14 @@ def test_claude_child_identity_and_mcp_capture(tmp_path, monkeypatch):
     try:
         response = mcp_response({"id": 1, "method": "tools/call", "params": {
             "name": "resume", "arguments": {"project": str(tmp_path)}}}, journal)
-        report = response["result"]["structuredContent"]["coverage"]
-        assert {c["session_id"] for c in report["conversations"]} == {"parent", "parent/agent-one"}
+        summary = response["result"]["structuredContent"]["coverage"]
+        assert summary["conversations_captured"] == 2 and "conversations" not in summary
         assert len(journal.search(tmp_path, "task")) == 2
         reply = mcp_response({"id": 2, "method": "tools/call", "params": {
             "name": "coverage", "arguments": {"project": str(tmp_path)}}}, journal)
-        assert reply["result"]["structuredContent"] == report
+        report = reply["result"]["structuredContent"]
+        assert {c["session_id"] for c in report["conversations"]} == {"parent", "parent/agent-one"}
+        assert all("metadata" not in c for c in report["conversations"])
     finally:
         journal.close()
 

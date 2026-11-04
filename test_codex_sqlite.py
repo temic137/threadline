@@ -207,7 +207,7 @@ def test_sqlite_transfer_and_real_destination_mcp(tmp_path):
     context = json.loads(result.stdout)["result"]["structuredContent"]
     assert context["status"] == "project_ready"
     assert [e["kind"] for p in context["recent_exchanges"] for e in p["events"]] == ["user_message", "command"]
-    assert context["decision_tracking"]["items"][0]["evidence"]
+    assert context["decision_tracking"]["items"][0]["evidence_ids"]
 
 
 def test_sqlite_capture_rolls_back_on_journal_write_failure(tmp_path, monkeypatch):

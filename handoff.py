@@ -404,9 +404,11 @@ def transfer_project(project, destination, home, db_path):
     try:
         _, coverage = synchronize(journal, project, home)
         context = journal.project_context(project)
+        # The overview is budget-limited; the export must list and contain every chat.
+        chats = journal.conversations(project)
+        context["conversations"] = chats
         context["coverage"] = coverage
         context["workspace"] = git_snapshot(project)
-        chats = context["conversations"]
         # Export the journal, not only this sync's results: unavailable older sources remain available.
         sessions = [{**chat, "events": [e for group in journal.exchanges(project, chat["source"], chat["id"]) for e in group]}
                     for chat in chats]
