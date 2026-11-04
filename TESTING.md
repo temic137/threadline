@@ -183,7 +183,7 @@ the Codex rollout files, which were read separately without using Handoff's pars
 
 | Project | User messages | Tool calls under the right request | Resume size | First / repeat |
 | --- | --- | --- | --- | --- |
-| Small, one main chat | 154 of 154 | 1,244 of 1,244 | ~3,250 tokens | 12.7s / 2.5s |
+| Small, 4 Codex threads | 154 of 154 | 1,244 of 1,244 | ~3,250 tokens | 12.7s / 2.5s |
 | Codex and Cursor history | 55 of 55 | 1,416 of 1,416 | ~3,300 tokens | 20.2s / 8.3s |
 | This repository's main chat | 56 of 56 | 354 of 354 | ~3,830 tokens | 12.3s / 5.2s |
 
