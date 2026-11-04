@@ -968,6 +968,9 @@ def mcp_response(request: dict, journal: Journal) -> dict | None:
 
 def serve_mcp(path: Path):
     import sys
+    # Clients speak UTF-8, but piped streams use the locale codepage on Windows.
+    if hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
     journal = Journal(path)
     try:
         for line in sys.stdin:
@@ -980,7 +983,11 @@ def serve_mcp(path: Path):
             except (ValueError, TypeError, KeyError, AttributeError) as exc:
                 response = {"jsonrpc": "2.0", "id": request.get("id") if isinstance(request, dict) else None,
                             "error": {"code": -32602 if isinstance(request, dict) else -32600, "message": str(exc)}}
+            except Exception as exc:  # One failed call must not disconnect every tool.
+                response = {"jsonrpc": "2.0", "id": request.get("id") if isinstance(request, dict) else None,
+                            "error": {"code": -32603, "message": f"{type(exc).__name__}: {exc}"}}
             if response is not None:
-                print(json.dumps(response, ensure_ascii=False), flush=True)
+                # ASCII escapes survive any stream encoding, and history may hold lone surrogates.
+                print(json.dumps(response), flush=True)
     finally:
         journal.close()
