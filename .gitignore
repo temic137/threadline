@@ -1,0 +1,9 @@
+# Captured chat history and generated exports stay local
+.handoff/
+HANDOFF.md
+
+__pycache__/
+.pytest_cache/
+*.egg-info/
+build/
+dist/

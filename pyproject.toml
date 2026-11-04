@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "handoff"
+version = "0.3.0"
+description = "Cross-harness coding-agent session handoff"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+handoff = "handoff:main"
+
+[tool.setuptools]
+py-modules = ["handoff", "handoff_sessions", "handoff_capture", "handoff_decisions", "handoff_typellm"]
+
+[dependency-groups]
+dev = ["pytest>=8.0.0"]

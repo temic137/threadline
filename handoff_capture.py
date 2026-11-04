@@ -1,0 +1,505 @@
+"""Project-wide capture. Source archives are redacted, never silently discarded."""
+import datetime
+import hashlib
+import json
+import sqlite3
+from pathlib import Path
+from collections import Counter
+from contextlib import closing
+
+from handoff_sessions import (
+    READERS, candidate_meta, candidate_paths, make_event, read_cursor,
+    sanitize_session, sanitize_value, session, text_of,
+)
+
+
+def workspace_path(value):
+    # Windows extended paths and ordinary paths identify the same workspace.
+    value = str(value)
+    if value.startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    return Path(value).resolve()
+
+
+def event_signature(event):
+    content = event["content"]
+    try:
+        content = json.dumps(json.loads(content), sort_keys=True, ensure_ascii=False)
+    except (ValueError, TypeError):
+        pass
+    return event["kind"], event["actor"], content
+
+
+def codex_databases(home, issues=None):
+    root = home / ".codex"
+    def latest(prefix):
+        try:
+            paths = [(int(p.stem[len(prefix):]), p) for p in root.glob(prefix + "*.sqlite")
+                     if p.stem[len(prefix):].isdigit()]
+        except OSError as exc:
+            if issues is not None:
+                issues.append({"source": "codex", "path": str(root), "reason": f"Database discovery failed: {exc}"})
+            return None
+        return max(paths, default=(0, None))[1]
+    return latest("state_"), latest("thread_history_")
+
+
+def codex_sqlite_events(sid, item, row, turn):
+    """Normalize public history items; unknown types remain in the source archive."""
+    kind = item.get("type")
+    timestamp = row.get("created_at_ms")
+    if timestamp is None and turn.get("started_at") is not None:
+        timestamp = turn["started_at"] * 1000
+    if timestamp is not None:
+        timestamp = datetime.datetime.fromtimestamp(int(timestamp) / 1000, datetime.timezone.utc).isoformat()
+    metadata = {"native_item_id": row["item_id"], "native_turn_id": row["turn_id"],
+                "rollout_ordinal": row["rollout_ordinal"], "source_format": "codex_sqlite",
+                "turn_status": turn.get("status")}
+    ordinal = int(row["rollout_ordinal"]) * 10
+    def event(event_kind, actor, content, extra=None, offset=0):
+        return make_event("codex", sid, ordinal+offset, event_kind, actor, content,
+                          timestamp or "", {**metadata, **(extra or {})})
+    if kind == "userMessage":
+        return [event("user_message", "user", text_of(item.get("content", [])))]
+    if kind == "agentMessage":
+        return [event("assistant_message", "assistant", text_of(item.get("text", "")), {"phase": item.get("phase")})]
+    if kind == "commandExecution":
+        return [event("command", "assistant", text_of(item.get("aggregatedOutput", "")),
+                      {"command": item.get("command"), "cwd": item.get("cwd"),
+                       "exit_code": item.get("exitCode"), "status": item.get("status")})]
+    if kind == "fileChange":
+        return [event("file_change", "assistant", json.dumps(item.get("changes", []), ensure_ascii=False),
+                      {"changes": item.get("changes", []), "status": item.get("status")})]
+    if kind in ("mcpToolCall", "dynamicToolCall", "webSearch"):
+        tool = {"tool_id": row["item_id"], "name": item.get("tool") or kind,
+                "server": item.get("server") or item.get("namespace"), "status": item.get("status")}
+        events = [event("tool_call", "assistant", json.dumps(item.get("arguments", item.get("query", "")), ensure_ascii=False), tool)]
+        result = item.get("result", item.get("contentItems", item.get("results")))
+        if result is not None or item.get("error"):
+            events.append(event("tool_result", "tool", json.dumps(result if result is not None else item["error"], ensure_ascii=False), tool, 1))
+        return events
+    return []
+
+
+def codex_sqlite_conversations(state_path, history_path, project, selected=None, issues=None):
+    """Read source databases in read-only transactions; never create or modify them."""
+    with closing(sqlite3.connect(state_path.resolve().as_uri() + "?mode=ro", uri=True)) as state:
+        state.row_factory = sqlite3.Row
+        state.execute("BEGIN")
+        tables = {r[0] for r in state.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        columns = {r[1] for r in state.execute("PRAGMA table_info(threads)")}
+        if not {"id", "cwd"} <= columns:
+            raise sqlite3.DatabaseError("Unsupported Codex state schema: threads id/cwd missing")
+        threads = [dict(r) for r in state.execute("SELECT * FROM threads")
+                   if r["cwd"] and workspace_path(r["cwd"]) == project and (not selected or r["id"] == selected)]
+        history = None
+        try:
+            if history_path:
+                history = sqlite3.connect(history_path.resolve().as_uri() + "?mode=ro", uri=True)
+                history.row_factory = sqlite3.Row
+                history.execute("BEGIN")
+                history_tables = {r[0] for r in history.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if not {"thread_items", "thread_turns"} <= history_tables:
+                    raise sqlite3.DatabaseError("Unsupported Codex history schema: thread_items/thread_turns missing")
+                for table, required in (("thread_items", {"thread_id", "turn_id", "item_id", "rollout_ordinal", "item_json"}),
+                                        ("thread_turns", {"thread_id", "turn_id", "rollout_ordinal"})):
+                    available = {r[1] for r in history.execute(f"PRAGMA table_info({table})")}
+                    if not required <= available:
+                        raise sqlite3.DatabaseError(f"Unsupported Codex history schema: {table} columns missing")
+                known = {r[0] for r in state.execute("SELECT id FROM threads")}
+                orphans = {r[0] for r in history.execute("SELECT DISTINCT thread_id FROM thread_items")} - known
+                if orphans and issues is not None:
+                    issues.append({"source": "codex", "path": str(history_path),
+                                   "reason": f"{len(orphans)} database thread(s) have no state metadata; project association unknown, not imported."})
+            for thread in threads:
+                sid = thread["id"]
+                rows, events, gaps = [("thread", thread)], [], []
+                metadata = {**thread, "source_format": "codex_sqlite", "history_database": str(history_path) if history_path else None}
+                try:
+                    metadata["source"] = json.loads(thread.get("source", ""))
+                except (ValueError, TypeError):
+                    pass
+                if "thread_spawn_edges" in tables:
+                    for edge in state.execute("SELECT * FROM thread_spawn_edges WHERE parent_thread_id=? OR child_thread_id=?", (sid, sid)):
+                        value = dict(edge)
+                        rows.append(("spawn:" + value["child_thread_id"], value))
+                        if value["child_thread_id"] == sid:
+                            metadata["parent_thread_id"] = value["parent_thread_id"]
+                if "thread_attachments" in tables:
+                    rows.extend(("attachment:" + r["id"], dict(r)) for r in state.execute("SELECT * FROM thread_attachments WHERE thread_id=?", (sid,)))
+                if history:
+                    turns = {r["turn_id"]: dict(r) for r in history.execute("SELECT * FROM thread_turns WHERE thread_id=? ORDER BY rollout_ordinal,turn_id", (sid,))}
+                    rows.extend(("turn:" + key, value) for key, value in turns.items())
+                    count = 0
+                    for native in history.execute("SELECT * FROM thread_items WHERE thread_id=? ORDER BY rollout_ordinal,turn_id,item_id", (sid,)):
+                        value = dict(native)
+                        rows.append(("item:" + value["turn_id"] + ":" + value["item_id"], value))
+                        count += 1
+                        try:
+                            item = sanitize_value(json.loads(value["item_json"]))
+                            if not isinstance(item, dict):
+                                raise ValueError("Expected object")
+                            events.extend(codex_sqlite_events(sid, item, value, turns.get(value["turn_id"], {})))
+                        except (ValueError, TypeError, KeyError, OverflowError, OSError):
+                            gaps.append("History item " + value["item_id"] + " could not be normalized; original row preserved.")
+                    if "thread_realtime_items" in history_tables:
+                        rows.extend(("realtime:" + r["item_id"], dict(r)) for r in history.execute("SELECT * FROM thread_realtime_items WHERE thread_id=? ORDER BY rollout_ordinal,item_id", (sid,)))
+                    if "thread_history_projection_state" in history_tables:
+                        cursor = history.execute("SELECT * FROM thread_history_projection_state WHERE thread_id=?", (sid,)).fetchone()
+                        if cursor:
+                            rows.append(("projection", dict(cursor)))
+                            boundary = dict(cursor).get("next_rollout_ordinal")
+                            if not gaps and count and isinstance(boundary, int) and boundary >= 0:
+                                metadata["projected_rollout_ordinal"] = boundary
+                    if not count:
+                        gaps.append("No history items available for this database-listed thread; conversation content may be missing.")
+                else:
+                    gaps.append("Codex history database unavailable; only thread metadata captured.")
+                gaps.append("SQLite rows preserved, including turn/item IDs. Unknown item types and realtime/attachment records are archive-only; attachment files are not copied.")
+                captured = session("codex", sid, str(project), state_path, events)
+                captured["metadata"] = metadata
+                yield captured, rows, gaps, metadata
+        finally:
+            if history:
+                history.close()
+
+
+def initialize(db):
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS capture_records (
+            project TEXT, source TEXT, session_id TEXT, location TEXT,
+            record_key TEXT, digest TEXT, payload TEXT, redacted INTEGER,
+            PRIMARY KEY(project, source, session_id, location, record_key, digest)
+        );
+        CREATE TABLE IF NOT EXISTS capture_state (
+            project TEXT, source TEXT, session_id TEXT, location TEXT,
+            digest TEXT, details TEXT,
+            PRIMARY KEY(project, source, session_id, location)
+        );
+        CREATE TABLE IF NOT EXISTS capture_reports (project TEXT PRIMARY KEY, report TEXT);
+        CREATE TABLE IF NOT EXISTS capture_event_links (
+            project TEXT, source TEXT, session_id TEXT, location TEXT, event_id TEXT,
+            PRIMARY KEY(project, source, session_id, location, event_id)
+        );
+        CREATE INDEX IF NOT EXISTS capture_event_links_event_location ON capture_event_links(event_id,location);
+        CREATE TABLE IF NOT EXISTS capture_snapshots (
+            project TEXT, source TEXT, session_id TEXT, location TEXT, digest TEXT,
+            captured_at TEXT, manifest TEXT,
+            PRIMARY KEY(project, source, session_id, location, digest)
+        );
+    """)
+
+
+def stored_report(journal, project):
+    initialize(journal.db)
+    row = journal.db.execute("SELECT report FROM capture_reports WHERE project=?",
+                             (str(project.resolve()),)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def record_types(kind, rows):
+    """Describe archived record types without claiming their fields were normalized."""
+    counts = Counter()
+    for key, value in rows:
+        if not isinstance(value, dict):
+            counts["unstructured"] += 1
+            continue
+        label = str(value.get("type", "unknown"))
+        payload = value.get("payload")
+        if kind == "codex" and key.startswith("item:"):
+            try:
+                label = "sqlite/" + str(json.loads(value["item_json"]).get("type", "unknown"))
+            except (ValueError, TypeError, KeyError, AttributeError):
+                label = "sqlite/malformed_item"
+        elif kind == "codex" and (key == "thread" or key == "projection" or key.startswith(("turn:", "spawn:", "attachment:", "realtime:"))):
+            label = "sqlite/" + key.split(":")[0]
+        elif kind == "codex" and isinstance(payload, dict) and payload.get("type"):
+            label += "/" + str(payload["type"])
+        elif kind == "muse" and isinstance(payload, dict):
+            event = payload.get("event")
+            if isinstance(event, dict):
+                label = str(event.get("kind", "unknown"))
+        elif kind == "cursor" and key == "header":
+            label = "header"
+        counts[label] += 1
+    supported = {
+        "codex": {"session_meta", "event_msg/user_message", "event_msg/agent_message", "event_msg/item_completed",
+                  "response_item/function_call", "response_item/custom_tool_call", "response_item/function_call_output",
+                  "response_item/custom_tool_call_output", "sqlite/userMessage", "sqlite/agentMessage",
+                  "sqlite/commandExecution", "sqlite/fileChange", "sqlite/mcpToolCall", "sqlite/dynamicToolCall", "sqlite/webSearch"},
+        "claude": {"user", "assistant"},
+        "muse": {"started", "assistant_message_committed", "assistant_tool_calls_committed",
+                 "tool_result_batch_committed", "failed", "terminal"},
+        "cursor": {"header", "1", "2"},
+    }[kind]
+    return dict(counts), {key: count for key, count in counts.items() if key not in supported}
+
+
+def cursor_conversations(path, project):
+    """Read a consistent SQLite snapshot; never archive another workspace's rows."""
+    global_db = path.parents[2] / "globalStorage" / "state.vscdb"
+    if global_db.exists():
+        with sqlite3.connect(global_db.resolve().as_uri() + "?mode=ro", uri=True) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("BEGIN")
+            headers = db.execute("SELECT * FROM composerHeaders WHERE workspaceId=?",
+                                 (path.parent.name,)).fetchall()
+            for header in headers:
+                sid = header["composerId"]
+                rows = [("header", dict(header))]
+                prefix = f"bubbleId:{sid}:"
+                for key, value in db.execute("SELECT key,value FROM cursorDiskKV WHERE substr(key,1,?)=?",
+                                             (len(prefix), prefix)):
+                    try:
+                        value = json.loads(value)
+                    except (ValueError, TypeError):
+                        pass
+                    rows.append((key, value))
+                # Normalize from this same snapshot; tool revisions remain in the archive.
+                events = []
+                for ordinal, (key, item) in enumerate(sorted(rows[1:], key=lambda r: (
+                        str(r[1].get("createdAt", "")) if isinstance(r[1], dict) else "", r[0]))):
+                    if not isinstance(item, dict):
+                        continue
+                    role = {1: "user", 2: "assistant"}.get(item.get("type"))
+                    if role and item.get("text"):
+                        events.append(make_event("cursor", sid, ordinal, role + "_message", role,
+                                                 item["text"], str(item.get("createdAt", "")), {"source_key": key}))
+                    tool = item.get("toolFormerData")
+                    if isinstance(tool, dict):
+                        events.append(make_event("cursor", sid, ordinal, "tool_result", "tool",
+                                                 str(tool.get("result", "")), str(item.get("createdAt", "")),
+                                                 {"source_key": key, **tool}))
+                captured = session("cursor", sid, str(project), path, events)
+                yield captured, rows, ["Cursor rows preserved; attachment files are not copied."], dict(header)
+        return
+    with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as db:
+        rows = list(db.execute("SELECT key,value FROM ItemTable WHERE lower(key) LIKE '%chat%' OR lower(key) LIKE '%composer%' OR lower(key) LIKE '%prompt%'"))
+    decoded = []
+    for key, value in rows:
+        try:
+            value = json.loads(value)
+        except (ValueError, TypeError):
+            pass
+        decoded.append((key, value))
+    rows = decoded
+    yield read_cursor(path, project), rows, [
+        "Legacy Cursor storage: conversation boundaries unsupported; captured workspace records as one collection."
+    ], {}
+
+
+def jsonl_capture(kind, path):
+    rows, gaps, metadata = [], [], {}
+    before = path.stat()
+    # ponytail: reread histories to detect rewrites; byte cursors only if profiling justifies them.
+    with path.open(encoding="utf-8") as stream:
+        for ordinal, line in enumerate(stream):
+            try:
+                value = json.loads(line)
+            except ValueError:
+                gaps.append(f"Record {ordinal}: malformed or partial JSON; preserved as text, retry next sync.")
+                value = line
+            rows.append((str(ordinal), value))
+            if isinstance(value, dict):
+                if value.get("type") == "session_meta":
+                    metadata.update(value.get("payload", {}))
+                for key in ("sessionId", "parentUuid", "isSidechain", "gitBranch", "cwd", "title"):
+                    if key in value:
+                        metadata[key] = value[key]
+    try:
+        captured = READERS[kind](path)
+    except (ValueError, TypeError, AttributeError, KeyError) as exc:
+        sid, workspace = candidate_meta(kind, path)
+        captured = session(kind, sid, workspace, path, [])
+        gaps.append(f"Normalization failed ({type(exc).__name__}); source records preserved, normalized events unavailable.")
+    after = path.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise OSError("Source changed during capture; retry synchronization.")
+    if kind == "claude" and "subagents" in path.parts:
+        parent_id = captured["id"]
+        captured["id"] = parent_id + "/" + path.stem
+        metadata["parent_session_id"] = parent_id
+        captured["events"] = [make_event(kind, captured["id"], e["ordinal"], e["kind"], e["actor"],
+                                          e["content"], e["timestamp"], e["metadata"]) for e in captured["events"]]
+    if not rows:
+        gaps.append("Empty source file.")
+    gaps.append("All source records archived; normalization covers selected message/tool types only. Attachment files are not copied.")
+    return captured, rows, gaps, metadata
+
+
+def synchronize(journal, project, home, source="auto", selected=None):
+    """Archive all exact-workspace matches, preserving revisions and explicit gaps."""
+    project = workspace_path(project)
+    initialize(journal.db)
+    report = {"project": str(project), "captured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "scope": "Accessible local sources in known storage locations; exact workspace matches only. Cloud history and other worktrees are not automatically included.",
+              "selection": {"source": source, "session": selected},
+              "conversations": [], "gaps": [], "new_records": 0, "new_events": 0}
+    seen, captured_sessions = set(), []
+    candidates = candidate_paths(home, source, report["gaps"])
+    state_path, history_path = codex_databases(home, report["gaps"]) if source in ("auto", "codex") else (None, None)
+    if state_path:
+        candidates.insert(0, ("codex", state_path, project))
+    elif history_path:
+        report["gaps"].append({"source": "codex", "path": str(history_path), "reason": "History database found without a state database; project association unavailable, not imported."})
+    projected, sqlite_threads = {}, set()
+    kinds = ("codex", "claude", "cursor", "muse") if source == "auto" else (source,)
+    report["sources"] = {kind: {"candidate_files": sum(k == kind for k, _, _ in candidates)} for kind in kinds}
+    if "codex" in report["sources"]:
+        report["sources"]["codex"]["sqlite_databases"] = {"state": str(state_path) if state_path else None,
+                                                        "history": str(history_path) if history_path else None}
+    for kind, path, known_project in candidates:
+        try:
+            is_codex_db = kind == "codex" and path == state_path
+            if kind != "cursor" and not is_codex_db:
+                with path.open(encoding="utf-8"):
+                    pass
+            if is_codex_db:
+                entries = codex_sqlite_conversations(path, history_path, project, selected, report["gaps"])
+            elif kind == "cursor":
+                if not known_project or workspace_path(known_project) != project:
+                    continue
+                entries = cursor_conversations(path, project)
+            else:
+                sid, workspace = candidate_meta(kind, path, known_project)
+                if not workspace:
+                    report["gaps"].append({"source": kind, "path": str(path), "reason": "Project association unavailable; source not imported."})
+                    continue
+                if workspace_path(workspace) != project:
+                    continue
+                selection_id = sid + "/" + path.stem if kind == "claude" and "subagents" in path.parts else sid
+                if selected and selected != selection_id and selected not in str(path):
+                    continue
+                entries = [jsonl_capture(kind, path)]
+            for captured, rows, gaps, metadata in entries:
+                sid = captured["id"]
+                if selected and selected != sid and selected not in str(path):
+                    continue
+                location = str(path.resolve())
+                projection = projected.get((sid, workspace_path(path))) if kind == "codex" and not is_codex_db else None
+                if projection is not None:
+                    cursor, matches, overlap_digest = projection
+                    original_count = len(captured["events"])
+                    retained = []
+                    for event in captured["events"]:
+                        signature = event_signature(event)
+                        if event["ordinal"] < cursor and matches[signature]:
+                            matches[signature] -= 1
+                            continue
+                        event["metadata"]["capture_sequence"] = 1
+                        retained.append(event)
+                    captured["events"] = retained
+                    metadata["sqlite_covered_events"] = original_count-len(captured["events"])
+                    metadata["sqlite_projected_before_ordinal"] = cursor
+                    metadata["sqlite_overlap_digest"] = overlap_digest
+                    if any(e["ordinal"] < cursor for e in retained):
+                        gaps.append("Some JSONL records before the SQLite projection boundary have no exact normalized match; retained rather than discarded. Duplicate tool activity or source-order differences may remain.")
+                elif kind == "codex" and not is_codex_db and sid in sqlite_threads:
+                    gaps.append("SQLite and this continuation segment overlap without a confirmed projection boundary; both retained, duplicate exchanges may appear.")
+                identity = (str(project), kind, sid, location)
+                seen.add(identity)
+                clean_rows = []
+                for key, value in rows:
+                    clean = sanitize_value(value)
+                    if is_codex_db and isinstance(clean, dict):
+                        for field in ("item_json", "error_json", "payload"):
+                            if isinstance(clean.get(field), str):
+                                try:
+                                    clean[field] = json.dumps(sanitize_value(json.loads(value[field])), ensure_ascii=False)
+                                except ValueError:
+                                    pass
+                    clean_rows.append((str(key), clean))
+                serialized = json.dumps(clean_rows, ensure_ascii=False, sort_keys=True)
+                policy = "codex-sqlite-v1:" if is_codex_db else (f"codex-overlap-v1:{cursor}:{overlap_digest}:" if projection is not None else "capture-v3:")
+                digest = hashlib.sha256((policy + serialized).encode()).hexdigest()
+                previous = journal.db.execute("SELECT digest FROM capture_state WHERE project=? AND source=? AND session_id=? AND location=?", identity).fetchone()
+                details = {"source": kind, "session_id": sid, "path": location,
+                           "records": len(rows), "events": len(captured["events"]),
+                           "status": "unchanged" if previous and previous[0] == digest else "imported",
+                           "metadata": sanitize_value(metadata), "gaps": gaps, "redacted_records": 0}
+                details["record_types"], details["archive_only_record_types"] = record_types(kind, rows)
+                owner = journal.db.execute("SELECT project, source_path FROM sessions WHERE source=? AND id=?",
+                                           (kind, sid)).fetchone()
+                conflict = owner and owner["project"] != str(project)
+                if conflict:
+                    details["status"] = "identity_conflict"
+                    gaps.append("Native session ID already belongs to another source location/project; records archived but normalized history not replaced.")
+                captured["project"] = str(project)
+                captured = sanitize_session(captured)
+                captured["events"] = [make_event(kind, sid, e["ordinal"], e["kind"], e["actor"],
+                                                 e["content"], e["timestamp"], {**e["metadata"], "source_path": location, "capture_order": order})
+                                      for order, e in enumerate(captured["events"])]
+                # Source revisions are append-only; normalized events reflect the latest source snapshot.
+                with journal.db:
+                    new_records, new_events = 0, 0
+                    manifest = []
+                    for (key, original), (_, value) in zip(rows, clean_rows):
+                        payload = json.dumps(value, ensure_ascii=False, sort_keys=True)
+                        redacted = original != value
+                        details["redacted_records"] += int(redacted)
+                        record_digest = hashlib.sha256(payload.encode()).hexdigest()
+                        manifest.append([str(key), record_digest])
+                        cursor = journal.db.execute("INSERT OR IGNORE INTO capture_records VALUES (?,?,?,?,?,?,?,?)",
+                                                    (*identity, str(key), record_digest, payload, int(redacted)))
+                        new_records += cursor.rowcount
+                    if not conflict and details["status"] != "unchanged" and not any("Normalization failed" in gap for gap in gaps):
+                        old_ids = {r[0] for r in journal.db.execute("""SELECT e.id FROM events e
+                            WHERE e.project=? AND e.source=? AND e.session_id=? AND (
+                                EXISTS (SELECT 1 FROM capture_event_links l WHERE l.event_id=e.id AND l.location=?)
+                                OR NOT EXISTS (SELECT 1 FROM capture_event_links l WHERE l.event_id=e.id))""", identity)}
+                        new_ids = {e["id"] for e in captured["events"]}
+                        new_events = len(new_ids - old_ids)
+                        for event_id in old_ids - new_ids:
+                            journal.db.execute("DELETE FROM events WHERE id=?", (event_id,))
+                            if journal.fts:
+                                journal.db.execute("DELETE FROM events_fts WHERE id=?", (event_id,))
+                        journal.import_session(captured, commit=False)
+                        journal.db.execute("DELETE FROM capture_event_links WHERE project=? AND source=? AND session_id=? AND location=?", identity)
+                        journal.db.executemany("INSERT OR IGNORE INTO capture_event_links VALUES (?,?,?,?,?)",
+                                               [(*identity, event_id) for event_id in new_ids])
+                    journal.db.execute("INSERT OR IGNORE INTO capture_snapshots VALUES (?,?,?,?,?,?,?)",
+                                       (*identity, digest, report["captured_at"], json.dumps(manifest)))
+                    journal.db.execute("INSERT OR REPLACE INTO capture_state VALUES (?,?,?,?,?,?)",
+                                       (*identity, digest, json.dumps(details)))
+                report["new_records"] += new_records
+                report["new_events"] += new_events
+                report["conversations"].append(details)
+                if not conflict:
+                    captured_sessions.append(captured)
+                    if is_codex_db and captured["events"]:
+                        sqlite_threads.add(sid)
+                    if is_codex_db and metadata.get("projected_rollout_ordinal") is not None and metadata.get("rollout_path"):
+                        signatures = Counter(event_signature(e) for e in captured["events"])
+                        overlap_digest = hashlib.sha256(json.dumps([e["id"] for e in captured["events"]]).encode()).hexdigest()
+                        projected[(sid, workspace_path(metadata["rollout_path"]))] = metadata["projected_rollout_ordinal"], signatures, overlap_digest
+        except (OSError, ValueError, TypeError, AttributeError, KeyError, sqlite3.Error) as exc:
+            report["gaps"].append({"source": kind, "path": str(path), "reason": f"Capture failed: {type(exc).__name__}: {exc}"})
+    for row in journal.db.execute("SELECT * FROM capture_state WHERE project=?", (str(project),)):
+        identity = tuple(row[key] for key in ("project", "source", "session_id", "location"))
+        if row["source"] in kinds and not selected and identity not in seen:
+            details = json.loads(row["details"])
+            details["status"] = "unavailable"
+            details["gaps"] = ["Previously captured source was not available in this scan; archived history retained."]
+            report["conversations"].append(details)
+    for kind, info in report["sources"].items():
+        if not info["candidate_files"]:
+            info["status"] = "No sources found in known local locations; installation/access not verified."
+    report["source_files_captured"] = len(captured_sessions)
+    grouped = {}
+    for captured in captured_sessions:
+        key = (captured["source"], captured["id"])
+        if key not in grouped:
+            grouped[key] = {**captured, "events": list(captured["events"])}
+        else:
+            grouped[key]["events"].extend(captured["events"])
+            grouped[key]["updated"] = max(grouped[key]["updated"], captured["updated"])
+    captured_sessions = list(grouped.values())
+    for captured in captured_sessions:
+        captured["events"].sort(key=lambda e: (e["metadata"].get("capture_sequence", 0), e["timestamp"], e["metadata"]["source_path"], e["ordinal"]))
+    report["conversations_captured"] = len(captured_sessions)
+    safe_report = sanitize_value(report)
+    journal.db.execute("INSERT OR REPLACE INTO capture_reports VALUES (?,?)", (str(project), json.dumps(safe_report)))
+    journal.db.commit()
+    return captured_sessions, safe_report
