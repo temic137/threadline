@@ -176,6 +176,28 @@ Read-only scan of local histories for this project into a temporary database:
 The temporary live-verification database was removed. Existing user history and the
 normal Handoff journal were not changed by this audit.
 
+## Accuracy against Codex's own files
+
+Each real project was captured into a temporary copy of the journal, then compared with
+the Codex rollout files, which were read separately without using Handoff's parser.
+
+| Project | User messages | Tool calls under the right request | Resume size | First / repeat |
+| --- | --- | --- | --- | --- |
+| Small, one main chat | 154 of 154 | 1,244 of 1,244 | ~3,250 tokens | 12.7s / 2.5s |
+| Codex and Cursor history | 55 of 55 | 1,416 of 1,416 | ~3,300 tokens | 20.2s / 8.3s |
+| This repository's main chat | 56 of 56 | 354 of 354 | ~3,830 tokens | 12.3s / 5.2s |
+
+Each project also had every Codex thread present and no duplicated messages. The only
+credential-shaped string returned was a `ghp_xxxxxxxx` placeholder.
+
+The real server command also ran end to end against a copy of an older journal
+(initialize, tool list, resume): it answered in about a second, upgraded the journal
+during the first resume, and did not grow it.
+
+Not measured: resume on a very large folder containing many independent projects. The
+second project's journal grew by 52 MB, mostly from its Cursor archive and tool metadata.
+Decision extraction can still pick up pasted text that was not the user's own decision.
+
 ## Limits of this verification
 
 Live matching history was Codex history. Cursor, Claude, and Muse parsing has fixture

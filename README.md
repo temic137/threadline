@@ -7,10 +7,14 @@ and gives the next agent a small evidence-linked working context through MCP.
 ## Install once
 
 ```powershell
-python -m pip install -e C:\path\to\handoff
+python -m pip install -e "C:\path\to\handoff[zstd]"
 handoff setup
 handoff doctor
 ```
+
+The `zstd` extra lets Handoff read the `.jsonl.zst` files Codex compresses older chats
+into. Python 3.14 can read them without it. If neither is available, Handoff reports the
+gap in its coverage report instead of quietly leaving those chats out.
 
 `setup` detects installed harnesses and registers `handoff --mcp` globally. Existing
 JSON/TOML configuration is backed up once with a `.handoff.bak` suffix. It preserves
@@ -55,8 +59,9 @@ Continue using handoff.
 
 The MCP server asks agents to call `resume`. This synchronizes all conversations
 matching the exact workspace path and returns a token-budgeted context with evidence
-IDs and a coverage report. Default resume includes the entire project inventory,
-bounded recent exchanges, project-wide decision evidence and retrieval pointers.
+IDs and a coverage report. Default resume puts the latest request first, then how the
+work ended, the project inventory, project-wide decision evidence and retrieval pointers.
+It stays within its token budget; `read_conversation` returns full history on demand.
 It ignores old remembered chat selections. Agents can call `capture` to synchronize, `coverage` to
 inspect the latest report, `search` for normalized history, and `evidence` for full
 normalized events. These tools do not recreate native chats in the destination.
