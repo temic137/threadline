@@ -1,5 +1,43 @@
 # Capture verification — 2026-10-04
 
+## Very large folder — 2026-11-04
+
+`python -m pytest -q`: **165 passed, 1 skipped** (the opt-in native credential test).
+
+Checked on one real folder holding many projects: 550 chats (466 Codex threads including
+child reviews, plus Cursor), 1,127 source files, on a machine with 15.8 GB of memory.
+Each run used a temporary copy of the journal and left the project folder unchanged.
+
+| | Before | After |
+| --- | --- | --- |
+| First capture | 13 min | about 5 min |
+| Journal size | 2.37 GB | about 850 MB |
+| Project resume, repeat | 13+ min, never finished | about 4 s |
+| Repeat capture, nothing changed | 33 s | under 1 s |
+| Search | over 6 min | 0.5–2.5 s |
+| Search result size | 45K characters | at most about 24K |
+| Free memory, lowest drop during capture | not measured | about 1.6 GB |
+
+Accuracy against Codex's rollout files, read without Handoff's parser:
+
+- No thread missing; 26,168 of 26,168 tool calls and all their outputs present.
+- Requests in time order in all 339 chats with history (262 Codex, 77 Cursor).
+- Tool calls under the right request: 25,727, plus 510 under a tagged message such as a
+  question reply, which the comparison had to learn to count as a request. None elsewhere.
+- No message repeated in the same chat at the same second.
+- 37 messages don't match exactly: 32 automated Guardian reviews and 5 others, some
+  containing secrets. Redaction is the likely reason; this was not confirmed for all 5.
+- 9 credential-shaped strings returned, all with a two-character template as the password.
+
+An earlier comparison reported this data as mostly correct while three chats were out of
+order, because it checked presence and not order. A direct time-order check now covers it.
+Upgrading a journal saved with wrong placement was also run: the same counts came back.
+
+Not checked: whether that upgrade adds duplicate events (it added 1,321 new events), and
+the quality of decision extraction on this folder, which listed 938 items, some of them
+passing remarks. On Claude Code chats, `latest_request` can pick up a system notice
+instead of the user's words. Figures are observed local runs, not a controlled benchmark.
+
 ## Codex SQLite history capture — 2026-11-01
 
 `python -m pytest -q --tb=short`: **92 passed, 1 skipped**. The skipped check
@@ -194,9 +232,8 @@ The real server command also ran end to end against a copy of an older journal
 (initialize, tool list, resume): it answered in about a second, upgraded the journal
 during the first resume, and did not grow it.
 
-Not measured: resume on a very large folder containing many independent projects. The
-second project's journal grew by 52 MB, mostly from its Cursor archive and tool metadata.
-Decision extraction can still pick up pasted text that was not the user's own decision.
+The second project's journal grew by 52 MB, mostly from its Cursor archive and tool
+metadata; this later fell to about 25 MB. Decision extraction can still pick up pasted text that was not the user's own decision.
 
 ## Limits of this verification
 

@@ -104,6 +104,28 @@ If even the latest exchange exceeds it, `read_required` points to that full exch
 `search_context` returns surrounding exchanges, retaining each conversation's identity.
 No goal or accepted decision is inferred from a message such as “continue.”
 
+### Large folders with many projects
+
+Chats belong to the exact folder the agent was opened in. If your chats were recorded
+at a parent folder, name it even when working in a subfolder, because resuming in the
+subfolder alone finds little:
+
+```text
+Use Handoff's resume tool on C:\path\to\parent, then search it for my-subproject
+and tell me where we left off.
+```
+
+The first capture of a very large folder takes minutes; one folder with 550 chats took
+about 5 minutes and 850 MB. After that, resume takes seconds. `search_context` lists
+every matching chat first and returns the best match from each, with long content
+shortened; `read_conversation` returns the full messages.
+
+To keep the journal small, messages are always stored whole, but tool output keeps only
+its first 6,000 and last 2,000 characters, with `metadata.source_path` pointing to the
+original. Source records over 2,000 characters keep a checksum instead of a copy, so a
+change is still detected but that record can't be rebuilt from the journal. Cursor's
+binary tool data is not stored.
+
 ## Decision evidence
 
 ### TypeLLM setup (Windows)
@@ -195,8 +217,9 @@ parent metadata. Source-file details remain individually visible in the report.
 Conflicting identities across projects are archived and flagged rather than allowed
 to replace another project's normalized history.
 Synchronization inserts only new source-record revisions and updates normalized
-events when sources change. It currently rereads source histories to detect rewrites;
-this is incremental storage, not byte-offset incremental reading.
+events when sources change. It compares each source's size and modified time and skips
+unchanged Codex and Cursor sources, so repeat captures are quick. A source that changed
+is read again from the start; this is not byte-offset incremental reading.
 
 For tools without MCP—or as a portable fallback—run this inside the project:
 
@@ -233,10 +256,11 @@ Uninstalling MCP configuration does not delete the journal or original agent ses
 
 ## Context quality
 
-- Redacted source payloads and their revisions remain in `capture_records` in
-  `~/.handoff/handoff.db`, keyed by project, source, session, location, record key,
-  and payload checksum. JSON formatting is not retained. Malformed JSON lines are
-  archived as text. Unknown fields/types survive even when not normalized.
+- Redacted source payloads up to 2,000 characters and their revisions remain in
+  `capture_records` in `~/.handoff/handoff.db`, keyed by project, source, session,
+  location, record key, and payload checksum. Larger records keep only their size and
+  checksum. JSON formatting is not retained. Malformed JSON lines are archived as text.
+  Unknown fields/types survive even when not normalized.
 - `capture_snapshots` stores ordered record/checksum manifests so captured revisions
   can be reconstructed. Event-to-source links prevent rewriting one continuation
   file from deleting events captured from another.
@@ -272,6 +296,9 @@ When JSONL overlaps SQLite, normalized events are omitted from the JSONL view on
 when both the recorded projection boundary and an exact normalized match support it.
 Newer/unmatched JSONL events and all source records remain captured. Unconfirmed
 overlap is retained and explicitly reported, so duplicate tool activity can remain.
+A compressed rollout merges into the database's messages only when most of those
+messages sit at matching lines in that file, whichever file the database names; other
+files stay separate, in time order. The same words in a later file count as a new message.
 Database-listed threads with no history rows and history threads without project
 metadata are reported as gaps; the tool cannot reconstruct content absent from both
 storage formats. Separate read transactions are used for the state/history databases;
