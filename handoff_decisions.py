@@ -14,7 +14,9 @@ RULES = (
 
 
 def clauses(text):
-    """Do not treat code blocks or Markdown block quotes as the user's decisions."""
+    """Do not treat code blocks, block quotes, client context or terminal pastes as decisions."""
+    from handoff_sessions import visible_text
+    text = re.split(r"(?m)(?:^|\s)PS [A-Za-z]:\\", visible_text(text))[0]
     in_code = False
     for line in text.splitlines():
         if line.lstrip().startswith("```"):
@@ -30,6 +32,8 @@ def clauses(text):
 
 def classify(quote):
     plain = re.sub(r"^(?:[-*]\s+|\d+[.)]\s+)", "", quote).strip()
+    if len(plain.split()) < 2:
+        return None
     if "?" in plain and not re.match(r"(?i)^can you\b", plain):
         return None
     if re.search(r"(?i)\b(?:maybe|perhaps|might|could|consider|for example|if)\b", plain):
@@ -56,14 +60,19 @@ def track(journal, project, source=None, session_id=None):
         if source and conversation["source"] != source or session_id and conversation["id"] != session_id:
             continue
         src, sid = conversation["source"], conversation["id"]
-        for group in journal.exchanges(project, src, sid):
+        if conversation["relationship"] == "child" and not session_id:
+            continue  # An agent wrote these prompts, so they are not the person's decisions.
+        agent_text = []
+        for group in journal.exchanges(project, src, sid, kinds=("user_message", "assistant_message")):
             pending = []
             for event in group:
+                if event["kind"] == "assistant_message":
+                    agent_text.append(event["content"])
                 if event["kind"] == "user_message":
                     for quote in clauses(event["content"]):
                         kind = classify(quote)
-                        if not kind:
-                            continue
+                        if not kind or any(quote in reply for reply in agent_text):
+                            continue  # Repeating the agent's wording is not the person's decision.
                         item = {"id": decision_id(src, sid, kind, quote, event["id"]),
                                 "kind": kind, "text": quote, "source": src, "session_id": sid,
                                 "status": "completion_unknown" if kind == "request" else "explicit_user_wording",

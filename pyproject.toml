@@ -9,6 +9,10 @@ description = "Cross-harness coding-agent session handoff"
 requires-python = ">=3.9"
 dependencies = []
 
+[project.optional-dependencies]
+# Reads Codex's compressed history before Python 3.14, which includes zstd.
+zstd = ["zstandard>=0.22"]
+
 [project.scripts]
 handoff = "handoff:main"
 
