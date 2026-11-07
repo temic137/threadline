@@ -101,7 +101,11 @@ reconstruction. Source order within each file is retained even with missing time
 The context budget uses a character-based token estimate, not an exact tokenizer.
 If even the latest exchange exceeds it, `read_required` points to that full exchange.
 `read_conversation` paginates full exchanges (a single exchange can be large).
-`search_context` returns surrounding exchanges, retaining each conversation's identity.
+`search_context` ignores filler words such as "what" and "did", ranks messages by how many of
+the remaining words they contain and then by relevance, and returns up to three matches per chat.
+Each match comes with the request it answered and that exchange's final reply; a long message is
+shown from the passage that matches best. Copies of a chat inside child tasks, such as automatic
+reviews, rank after the main chats. Tool output is searched only when messages give too few matches.
 No goal or accepted decision is inferred from a message such as “continue.”
 
 ### Large folders with many projects
@@ -117,8 +121,8 @@ and tell me where we left off.
 
 The first capture of a very large folder takes minutes; one folder with 550 chats took
 about 5 minutes and 850 MB. After that, resume takes seconds. `search_context` lists
-every matching chat first and returns the best match from each, with long content
-shortened; `read_conversation` returns the full messages.
+every matching chat first, then the best passages, with long content shortened;
+`read_conversation` returns the full messages.
 
 To keep the journal small, messages are always stored whole, but tool output keeps only
 its first 6,000 and last 2,000 characters, with `metadata.source_path` pointing to the

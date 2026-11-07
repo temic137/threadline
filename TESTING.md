@@ -235,6 +235,25 @@ during the first resume, and did not grow it.
 The second project's journal grew by 52 MB, mostly from its Cursor archive and tool
 metadata; this later fell to about 25 MB. Decision extraction can still pick up pasted text that was not the user's own decision.
 
+## Search accuracy — 2026-11-07
+
+Questions were made from exchanges drawn at random from the original Codex files of a
+large folder (466 Codex chats), all from older compressed files, and each answer was read
+from those files without Handoff. A script then asked `search_context` each question,
+with the 24,000-character limit agents get, and checked whether the exact answer text
+came back. "Short" is a few keywords, as agents usually search.
+
+| Question set | Old search: full / short | New search: full / short |
+| --- | --- | --- |
+| 18 questions used while changing the search | 0 / 0 | 13 / 16 |
+| 11 unseen questions, written before scoring | 1 / 0 | 9 / 11 |
+
+The old search found the right chat almost every time but then showed that
+chat's newest message containing any query word, so filler words decided the result.
+Answers missed by the new search are in chats where many exchanges share the question's
+words; `read_conversation` is still needed there. Cursor and Claude Code history were
+not part of this check, and no agent answers were scored.
+
 ## Limits of this verification
 
 Live matching history was Codex history. Cursor, Claude, and Muse parsing has fixture

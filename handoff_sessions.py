@@ -915,11 +915,11 @@ class Journal:
 
     def matching_chats(self, project: Path, query: str, limit=15) -> list[dict]:
         """Every chat a query appears in, main chats and the person's own words first."""
-        terms = re.findall(r"[\w./:-]+", query, re.UNICODE)
+        terms = query_terms(query)
         if not terms:
             return []
         key = str(project.resolve())
-        match = " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms[:12])
+        match = " OR ".join(f'"{term}"' for term in terms)
         columns = "e.source,e.session_id,count(*),sum(e.kind='user_message'),max(e.timestamp)"
         try:
             if not self.fts:
@@ -927,8 +927,9 @@ class Journal:
             rows = self.db.execute(f"""SELECT {columns} FROM events_fts f JOIN events e ON e.rowid=f.rowid
                 WHERE e.project=? AND events_fts MATCH ? GROUP BY 1,2""", (key, match)).fetchall()
         except sqlite3.OperationalError:
-            rows = self.db.execute(f"SELECT {columns} FROM events e WHERE e.project=? AND e.content LIKE ? GROUP BY 1,2",
-                                   (key, f"%{query}%")).fetchall()
+            like = " OR ".join("e.content LIKE ?" for _ in terms)
+            rows = self.db.execute(f"SELECT {columns} FROM events e WHERE e.project=? AND ({like}) GROUP BY 1,2",
+                                   (key, *[f"%{t}%" for t in terms])).fetchall()
         known = {(c["source"], c["id"]): c for c in self.conversations(project)}
         chats = []
         for source, session_id, hits, asked, latest in rows:
@@ -954,49 +955,86 @@ class Journal:
                                   (*key, f"%{query}%")).fetchone()
         return dict(row) | {"metadata": json.loads(row["metadata"])} if row else None
 
+    def ranked_hits(self, project: Path, query: str, kinds, pool=300) -> list[dict]:
+        """Events ranked by how many of the query's meaningful words they contain, then by bm25."""
+        terms = query_terms(query)
+        if not terms:
+            return []
+        key, marks = str(project.resolve()), ",".join("?" * len(kinds))
+        try:
+            if not self.fts:
+                raise sqlite3.OperationalError("FTS5 unavailable")
+            match = " OR ".join(f'"{term}"' for term in terms)
+            rows = self.db.execute(f"""SELECT e.*, bm25(events_fts) AS score FROM events_fts f JOIN events e ON e.rowid=f.rowid
+                WHERE events_fts MATCH ? AND e.project=? AND e.kind IN ({marks}) ORDER BY score LIMIT ?""",
+                                   (match, key, *kinds, pool)).fetchall()
+        except sqlite3.OperationalError:
+            like = " OR ".join("content LIKE ?" for _ in terms)
+            rows = self.db.execute(f"SELECT *, 0 AS score FROM events WHERE project=? AND kind IN ({marks}) AND ({like}) "
+                                   "ORDER BY timestamp DESC LIMIT ?", (key, *kinds, *[f"%{t}%" for t in terms], pool * 3)).fetchall()
+        hits = []
+        for row in rows:
+            words = set(re.findall(r"\w+", (row["content"] or "").lower()))
+            hits.append(dict(row) | {"metadata": json.loads(row["metadata"]), "terms_matched": sum(t in words for t in terms)})
+        hits.sort(key=lambda h: (-h["terms_matched"], h["score"], h["timestamp"] or ""))
+        return hits
+
     def search_context(self, project: Path, query: str, limit=5, max_chars=None) -> dict:
+        """The best matching passages across chats, at most three per chat, each shown with
+        the request it answered and the final reply. read_conversation returns whole messages."""
         chats = self.matching_chats(project, query)
-        # The best match in each chat first, so one long chat cannot crowd out the others.
-        hits = [hit for hit in (self.search_in_chat(project, query, c["source"], c["session_id"]) for c in chats[:min(max(limit, 1), 20)]) if hit]
-        seen_ids = {hit["id"] for hit in hits}
+        limit = min(max(limit, 1), 20)
+        hits = self.ranked_hits(project, query, ("user_message", "assistant_message"), pool=600)
         if len(hits) < limit:
-            hits += [hit for hit in self.search(project, query, min(max(limit, 1), 20)) if hit["id"] not in seen_ids][:limit - len(hits)]
+            hits += self.ranked_hits(project, query, ("file_change", "tool_call", "command", "tool_result"))
+        # Child tasks, such as automatic reviews, often hold copies of a main chat's messages.
+        children = {(c["source"], c["id"]) for c in self.conversations(project) if c["relationship"] == "child"}
+        hits.sort(key=lambda h: (h["source"], h["session_id"]) in children)
         if max_chars:
             # Titles can be whole pasted documents, and the list counts towards the limit.
             chats = [{**chat, "title": chat["title"][:_SEARCH_TITLE_CHARS]} for chat in chats]
-        results, seen, used, omitted = [], set(), len(json.dumps(chats, ensure_ascii=False)) if max_chars else 0, 0
-        outlines = {}
+        terms = query_terms(query)
+        results, seen, per_chat, outlines = [], set(), {}, {}
+        used, omitted = len(json.dumps(chats, ensure_ascii=False)) if max_chars else 0, 0
         for hit in hits:
+            if len(results) == limit:
+                break
             chat = (hit["source"], hit["session_id"])
+            if per_chat.get(chat, 0) == 3:
+                continue
             if chat not in outlines:
                 outlines[chat] = self.exchanges(project, *chat, with_content=False)
             groups = outlines[chat]
             index = next((i for i, group in enumerate(groups) if any(e["id"] == hit["id"] for e in group)), None)
-            key = (hit["source"], hit["session_id"], index)
-            if index is None or key in seen:
+            if index is None or (*chat, index) in seen:
                 continue
-            seen.add(key)
-            result = {"match_id": hit["id"], **self.read_conversation(
-                project, hit["source"], hit["session_id"], index if max_chars else max(0, index-1), 1 if max_chars else 3,
-                messages_only=bool(max_chars), keep_event=hit["id"], groups=groups)}
-            if max_chars:
-                # A search shows where to look; read_conversation returns the whole messages.
-                for exchange in result["exchanges"]:
-                    replies = [e for e in exchange["events"] if e["kind"] == "assistant_message"]
-                    exchange["events"] = [e for e in exchange["events"] if e["kind"] != "assistant_message"
-                                          or e["id"] == hit["id"] or e is replies[-1]]
-                    for event in exchange["events"]:
-                        if len(event["content"]) > _SEARCH_EVENT_CHARS:
-                            event["full_chars"] = len(event["content"])
-                            event["content"] = event["content"][:_SEARCH_EVENT_CHARS]
-                            event["content_truncated"] = True
+            group = groups[index]
+            request = next((e for e in group if e["kind"] == "user_message"), None)
+            replies = [e for e in group if e["kind"] == "assistant_message"]
+            finals = [e for e in replies if e["metadata"].get("phase") == "final_answer"] or replies
+            keep = {e["id"] for e in (request, hit, finals[-1] if finals else None) if e}
+            events = self.hydrate([e for e in group if e["id"] in keep])
+            for event in events:
+                if max_chars and len(event["content"]) > _SEARCH_EVENT_CHARS:
+                    full = len(event["content"])
+                    start = best_window(event["content"], terms, _SEARCH_EVENT_CHARS) if event["id"] == hit["id"] else 0
+                    event.update(content=event["content"][start:start + _SEARCH_EVENT_CHARS], content_truncated=True,
+                                 full_chars=full, shown_from_char=start)
+            result = {"match_id": hit["id"], "source": hit["source"], "session_id": hit["session_id"],
+                      "terms_matched": f"{hit['terms_matched']} of {len(terms)}",
+                      "boundary_method": "inferred from user messages and tool links", "total_exchanges": len(groups),
+                      "exchanges": [{"index": index, "events": events, "events_total": len(group)}],
+                      "read_more": {"tool": "read_conversation", "start": index, "limit": 1, "messages_only": True}}
             cost = len(json.dumps(result, ensure_ascii=False))
             if results and max_chars and used + cost > max_chars:
                 omitted += 1
                 continue
+            seen.add((*chat, index))
+            per_chat[chat] = per_chat.get(chat, 0) + 1
             results.append(result)
             used += cost
-        return {"matching_chats": chats, "results": results, "omitted_results": omitted}
+        return {"matching_chats": chats, "results": results, "omitted_results": omitted,
+                "searched_words": terms}
 
     def projects(self) -> list[dict]:
         return [dict(row) for row in self.db.execute(
@@ -1146,6 +1184,34 @@ _MCP_PAGE_CHARS = 60000
 _MCP_SEARCH_CHARS = 24000
 _SEARCH_TITLE_CHARS = 120
 _SEARCH_EVENT_CHARS = 1500
+
+
+_STOP_WORDS = set("""a about after again all also am an and any are as at be been before being both but by can could
+did do does doing done each few for from further get got had has have having he her here hers him his how i if in into
+is it its just let lets me more most much my no nor not now of off on once only or other our ours out over own same she
+should so some such than that the their theirs them then there these they this those through to too under until up us
+very was we were what when where which while who whom why will with would you your yours tell show find know think
+please want need okay ok yes""".split())
+
+
+def query_terms(query: str) -> list[str]:
+    """The words a search should match: lowercase, without filler words, at most 12."""
+    words = [w.lower() for w in re.findall(r"\w+", query or "", re.UNICODE)]
+    kept = [w for w in dict.fromkeys(words) if w not in _STOP_WORDS and (len(w) > 1 or w.isdigit())]
+    return (kept or list(dict.fromkeys(words)))[:12]
+
+
+def best_window(text: str, terms: list[str], width: int) -> int:
+    """Where a passage of the given width covers the most different query words."""
+    lower = text.lower()
+    spots = sorted((m.start(), term) for term in terms for m in re.finditer(r"\b" + re.escape(term) + r"\b", lower))
+    best, best_count = 0, -1
+    for position, _ in spots:
+        start = max(0, min(position - width // 4, len(text) - width))
+        count = len({term for spot, term in spots if start <= spot < start + width})
+        if count > best_count:
+            best, best_count = start, count
+    return best
 
 
 def visible_text(text: str) -> str:
