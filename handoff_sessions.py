@@ -1017,7 +1017,8 @@ class Journal:
             for event in events:
                 if max_chars and len(event["content"]) > _SEARCH_EVENT_CHARS:
                     full = len(event["content"])
-                    start = best_window(event["content"], terms, _SEARCH_EVENT_CHARS) if event["id"] == hit["id"] else 0
+                    start = (hit.get("passage_start", best_window(event["content"], terms, _SEARCH_EVENT_CHARS))
+                             if event["id"] == hit["id"] else 0)
                     event.update(content=event["content"][start:start + _SEARCH_EVENT_CHARS], content_truncated=True,
                                  full_chars=full, shown_from_char=start)
             result = {"match_id": hit["id"], "source": hit["source"], "session_id": hit["session_id"],
