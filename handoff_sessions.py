@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -581,6 +582,7 @@ def discover(project: Path, home: Path, source: str = "auto", selected: str | No
 class Journal:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.path, self._meaning = path, None
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -609,6 +611,35 @@ class Journal:
 
     def close(self):
         self.db.close()
+
+    @property
+    def meaning(self):
+        """The meaning-search index, or None when its optional packages are not installed
+        or HANDOFF_MEANING=0 turns it off."""
+        if self._meaning is None:
+            from handoff_meaning import MeaningIndex, available
+            self._meaning = MeaningIndex(self.path) if os.environ.get("HANDOFF_MEANING") != "0" and available() else False
+        return self._meaning or None
+
+    @meaning.setter
+    def meaning(self, index):
+        self._meaning = index
+
+    def meaning_hits(self, project: Path, query: str, pool=300) -> list[dict]:
+        index = self.meaning
+        found = index.hits(project, query, pool) if index else []
+        if not found:
+            return []
+        terms = query_terms(query)
+        rows = {row["id"]: row for row in self.get_all([event_id for event_id, _, _ in found])}
+        hits = []
+        for event_id, start, similarity in found:
+            row = rows.get(event_id)
+            if row:
+                words = set(re.findall(r"\w+", (row["content"] or "").lower()))
+                hits.append(row | {"terms_matched": sum(t in words for t in terms), "score": -similarity,
+                                   "passage_start": start, "found_by": "meaning"})
+        return hits
 
     def import_session(self, captured: dict, commit=True) -> int:
         project = str(Path(captured["project"]).resolve()) if captured["project"] else ""
@@ -985,6 +1016,16 @@ class Journal:
         chats = self.matching_chats(project, query)
         limit = min(max(limit, 1), 20)
         hits = self.ranked_hits(project, query, ("user_message", "assistant_message"), pool=600)
+        meaning = self.meaning_hits(project, query)
+        if meaning:
+            # One result from each list in turn, so neither can crowd out the other. Measured on
+            # reworded questions, this found more answers than either list or a weighted blend.
+            merged, taken = [], set()
+            for pair in itertools.zip_longest(meaning, hits):
+                for hit in pair:
+                    if hit and hit["id"] not in taken:
+                        taken.add(hit["id"]); merged.append(hit)
+            hits = merged
         if len(hits) < limit:
             hits += self.ranked_hits(project, query, ("file_change", "tool_call", "command", "tool_result"))
         # Child tasks, such as automatic reviews, often hold copies of a main chat's messages.
@@ -1035,7 +1076,7 @@ class Journal:
             results.append(result)
             used += cost
         return {"matching_chats": chats, "results": results, "omitted_results": omitted,
-                "searched_words": terms}
+                "searched_words": terms, "searched_by_meaning": bool(meaning)}
 
     def projects(self) -> list[dict]:
         return [dict(row) for row in self.db.execute(
@@ -1063,6 +1104,8 @@ class Journal:
             params.append(session_id)
         if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='selected_conversations'").fetchone():
             self.db.execute(f"DELETE FROM selected_conversations WHERE {clause}", params)
+        from handoff_meaning import delete as delete_vectors
+        delete_vectors(self.db, project_value, session_id)
         ids = [row[0] for row in self.db.execute(f"SELECT id FROM events WHERE {clause}", params)]
         self.db.execute(f"DELETE FROM events WHERE {clause}", params)
         for table in ("capture_records", "capture_state", "capture_event_links", "capture_snapshots", "decision_annotations"):
@@ -1074,6 +1117,13 @@ class Journal:
             self.db.execute("DELETE FROM sessions WHERE project=?", (project_value,))
         self.db.commit()
         return len(ids)
+
+    def get_all(self, ids: list[str]) -> list[dict]:
+        rows = []
+        for first in range(0, len(ids), 500):
+            chunk = ids[first:first + 500]
+            rows += self.db.execute(f"SELECT * FROM events WHERE id IN ({','.join('?' * len(chunk))})", chunk).fetchall()
+        return [dict(row) | {"metadata": json.loads(row["metadata"])} for row in rows]
 
     def get(self, ids: list[str]) -> list[dict]:
         if not ids:
@@ -1362,7 +1412,7 @@ def mcp_response(request: dict, journal: Journal) -> dict | None:
              "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}}, "required": ["project"]}},
             {"name": "read_conversation", "description": "Read ordered exchanges without shortening messages. Large pages end early; continue with next_start. Set messages_only to skip tool output.",
              "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}, "source": {"type": "string"}, "session_id": {"type": "string"}, "start": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 50}, "messages_only": {"type": "boolean"}}, "required": ["project", "source", "session_id"]}},
-            {"name": "search_context", "description": "Search all project chats and return the messages around each match with source identities.",
+            {"name": "search_context", "description": "Search all project chats by words and, when installed, by meaning. Each result is the matching passage with the request it answered and the final reply. One wording often misses: when the first search does not answer the question, search again with 2-3 different wordings, such as the exact names, file names or error text likely used at the time, and plain synonyms.",
              "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}, "query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["project", "query"]}},
             {"name": "capture", "description": "Synchronize every matching local conversation and summarize capture coverage.",
              "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}}, "required": ["project"]}},
@@ -1391,6 +1441,8 @@ def mcp_response(request: dict, journal: Journal) -> dict | None:
         from handoff_capture import coverage_page, stored_report, summarize_report, synchronize
         if name == "capture" or (name == "resume" and args.get("refresh", True)):
             _, coverage = synchronize(journal, project, Path.home())
+        if name in ("capture", "resume", "search_context") and journal.meaning:
+            journal.meaning.index_in_background(project)  # New messages become searchable by meaning.
         if name == "resume":
             token_budget = max(1000, min(int(args.get("token_budget", 4000)), 32000))
             selected = args.get("source") or args.get("session_id")
@@ -1422,6 +1474,8 @@ def mcp_response(request: dict, journal: Journal) -> dict | None:
                                              messages_only=bool(args.get("messages_only")), max_chars=_MCP_PAGE_CHARS)
         elif name == "search_context":
             data = journal.search_context(project, str(args.get("query", "")), min(limit, 20), max_chars=_MCP_SEARCH_CHARS)
+            if journal.meaning:
+                data["meaning_index"] = journal.meaning.status(project)
         elif name == "coverage":
             data = coverage_page(stored_report(journal, project), int(args.get("start", 0)), limit) or {"status": "No capture report; run capture first."}
         elif name == "search":

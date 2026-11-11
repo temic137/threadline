@@ -254,6 +254,38 @@ Answers missed by the new search are in chats where many exchanges share the que
 words; `read_conversation` is still needed there. Cursor and Claude Code history were
 not part of this check, and no agent answers were scored.
 
+## Meaning search — 2026-11-11
+
+29 questions worded the way a person asks, not with the words used in the chat (for example
+"Which details do we pull from the national ID slip now?"), from the same folder; answers
+read from the Codex files without Handoff. Scored like the section above, on a copy of the
+journal (29,150 indexed messages). "Four searches" adds three rewordings per question,
+written once by a small model without seeing the answers, each run as its own search.
+
+| Search | One search | Four searches |
+| --- | --- | --- |
+| Words only | 4 / 29 | 15 / 29 |
+| Words and meaning (all-MiniLM-L6-v2) | 12 / 29 | 21 / 29 |
+
+Other ways tried on the same questions and dropped:
+- Blending scores (reciprocal rank fusion) found fewer answers than alternating the two lists.
+- A cross-encoder reranker (ms-marco-MiniLM-L-6) found fewer answers and added seconds per search.
+- A static model (potion-retrieval-32M) indexed in seconds but found 7 of 29.
+- Ranking the same candidates with bigger or newer models:
+
+| Model | One search | Four searches | Full index |
+| --- | --- | --- | --- |
+| all-MiniLM-L6-v2 | 10 | 19 | ~33 min |
+| snowflake-arctic-embed-xs | 8 | 18 | ~65 min |
+| granite-embedding-small-english-r2 | 8 | 21 | ~118 min |
+| nomic-embed-text-v1.5 (8-bit) | 14 | 19 | ~204 min |
+| EmbeddingGemma-300m (8-bit, ~100 candidates) | 15 | not run | ~260 min |
+
+With rewordings, the differences are within chance for 29 questions, so the smallest and
+fastest model stays. Search takes about 2.3 s on this journal against 1.7 s with words only;
+the first search in a session takes about 8 s while the model and vectors load, which the
+background indexer does in advance. Timings are from one Windows laptop processor.
+
 ## Limits of this verification
 
 Live matching history was Codex history. Cursor, Claude, and Muse parsing has fixture

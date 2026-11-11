@@ -106,6 +106,23 @@ the remaining words they contain and then by relevance, and returns up to three 
 Each match comes with the request it answered and that exchange's final reply; a long message is
 shown from the passage that matches best. Copies of a chat inside child tasks, such as automatic
 reviews, rank after the main chats. Tool output is searched only when messages give too few matches.
+
+#### Search by meaning (optional)
+
+Word search misses answers written in other words ("database client" against "DBeaver").
+Installing the optional extra adds meaning search, which runs alongside word search:
+
+```bash
+pip install "handoff[meaning]"
+```
+
+It downloads the all-MiniLM-L6-v2 model (90 MB) once into `~/.handoff/models`. Each message's
+first ~3,000 characters are stored as vectors in the journal, about 60 MB for 30,000 messages. The
+MCP server indexes in the background, newest messages first, so recent work is searchable
+within minutes; a large history (about 30,000 messages) takes roughly 35 minutes once, using
+half the processor cores, and resumes where it stopped. `handoff index --project DIR` builds it
+in the foreground with progress. Results then alternate between the best meaning match and the
+best word match. Set `HANDOFF_MEANING=0` to turn it off. Child tasks such as reviews are not indexed.
 No goal or accepted decision is inferred from a message such as “continue.”
 
 ### Large folders with many projects

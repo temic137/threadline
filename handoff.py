@@ -12,6 +12,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from handoff_sessions import (
@@ -573,6 +574,33 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             journal.close()
         return 0
+    if argv and argv[0] == "index":
+        from handoff_capture import synchronize
+        from handoff_meaning import MeaningIndex, available
+        command = argparse.ArgumentParser(prog="handoff index", description="Build the meaning-search index, newest messages first. Safe to stop and rerun.")
+        command.add_argument("--project", default=".")
+        command.add_argument("--db")
+        options = command.parse_args(argv[1:])
+        if not available():
+            print("Meaning search is not installed. Run: pip install \"handoff[meaning]\"")
+            return 2
+        project = Path(options.project).resolve()
+        db_path = Path(options.db).resolve() if options.db else default_db
+        journal = Journal(db_path)
+        try:
+            synchronize(journal, project, home)
+        finally:
+            journal.close()
+        index, began = MeaningIndex(db_path), time.monotonic()
+        def progress(done, total):
+            print(f"{chr(13)}{done}/{total} messages, {time.monotonic() - began:.0f}s", end="", flush=True)
+        try:
+            index.index(project, progress=progress)
+        except KeyboardInterrupt:
+            print("\nStopped; rerun to continue.")
+            return 1
+        print("\n" + json.dumps(index.status(project)))
+        return 0
     if argv and argv[0] in ("sync", "coverage"):
         from handoff_capture import synchronize, stored_report
         command = argparse.ArgumentParser(prog=f"handoff {argv[0]}")
@@ -643,6 +671,7 @@ def main(argv: list[str] | None = None) -> int:
   configure   securely configure TypeLLM (configure typellm)
   extract     extract decisions across all project chats using TypeLLM (optional)
   sync        capture all matching local conversations, without writing HANDOFF.md
+  index       build the optional meaning-search index (needs handoff[meaning])
   coverage    show the last capture report
   doctor      check histories, journal, search, and MCP
   uninstall   remove handoff MCP entries

@@ -12,12 +12,14 @@ dependencies = []
 [project.optional-dependencies]
 # Reads Codex's compressed history before Python 3.14, which includes zstd.
 zstd = ["zstandard>=0.22"]
+# Search by meaning as well as words; downloads the 90 MB all-MiniLM-L6-v2 model once.
+meaning = ["fastembed>=0.4", "numpy>=1.24"]
 
 [project.scripts]
 handoff = "handoff:main"
 
 [tool.setuptools]
-py-modules = ["handoff", "handoff_sessions", "handoff_capture", "handoff_decisions", "handoff_typellm"]
+py-modules = ["handoff", "handoff_sessions", "handoff_capture", "handoff_decisions", "handoff_typellm", "handoff_meaning"]
 
 [dependency-groups]
 dev = ["pytest>=8.0.0"]
