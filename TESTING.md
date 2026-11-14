@@ -302,6 +302,18 @@ had not been looked at while tuning; each answer text was checked to appear in t
 The reranker added about 3.3 s per search (7.1 s at worst) and lost a question on the first
 set, so it was not adopted. Haiku's choices for both sets cost about $0.034.
 
+Smaller search replies were tried to save tokens (the match list's share scaled with the limit):
+
+| Reply limit (characters) | First 29: results / incl. match list | New 30: results / incl. match list |
+| --- | --- | --- |
+| 8,000 | 13 / 14 | 14 / 15 |
+| 12,000 | 13 / 17 | 14 / 22 |
+| 16,000 | 16 / 19 | 21 / 25 |
+| 24,000 | 21 / 23 | 23 / 27 |
+
+The 24,000 limit stays. Comparing the question with all 40,669 stored passages takes about 6 ms
+of a 3–12 s search, so clustering the vectors (k-means style indexes) would not make it faster.
+
 ## Limits of this verification
 
 Live matching history was Codex history. Cursor, Claude, and Muse parsing has fixture
