@@ -840,6 +840,17 @@ class Journal:
                 "total_exchanges": len(groups), "messages_only": bool(messages_only), "exchanges": page,
                 "next_start": end if end < len(groups) else None}
 
+    def read_exchange_of(self, project: Path, event_id: str, messages_only=True, max_chars=None) -> dict:
+        """The whole exchange holding one event, such as a match listed in a search's more_matches."""
+        row = self.db.execute("SELECT source, session_id FROM events WHERE id=? AND project=?",
+                              (event_id, str(project.resolve()))).fetchone()
+        if not row:
+            raise ValueError("Event does not belong to this project")
+        groups = self.exchanges(project, row[0], row[1], with_content=False)
+        index = next(i for i, group in enumerate(groups) if any(e["id"] == event_id for e in group))
+        return self.read_conversation(project, row[0], row[1], index, 1, messages_only=messages_only,
+                                      max_chars=max_chars, keep_event=event_id, groups=groups)
+
     def activity(self, project: Path) -> dict:
         rows = self.db.execute("SELECT source,session_id,MAX(timestamp) FROM events WHERE project=? GROUP BY source,session_id",
                                (str(project.resolve()),))
@@ -1031,12 +1042,22 @@ class Journal:
         # Child tasks, such as automatic reviews, often hold copies of a main chat's messages.
         children = {(c["source"], c["id"]) for c in self.conversations(project) if c["relationship"] == "child"}
         hits.sort(key=lambda h: (h["source"], h["session_id"]) in children)
+        # The same message is often stored several times (resumed or copied chats); the main chat's copy is enough.
+        unique, texts = [], set()
+        for hit in hits:
+            text = " ".join((hit["content"] or "").split())
+            if len(text) < 200 or text not in texts:  # Short messages such as "continue" differ by context.
+                texts.add(text)
+                unique.append(hit)
+        hits = unique
         if max_chars:
             # Titles can be whole pasted documents, and the list counts towards the limit.
             chats = [{**chat, "title": chat["title"][:_SEARCH_TITLE_CHARS]} for chat in chats]
         terms = query_terms(query)
         results, seen, per_chat, outlines = [], set(), {}, {}
         used, omitted = len(json.dumps(chats, ensure_ascii=False)) if max_chars else 0, 0
+        # Space is kept for a list of further matches, which the agent judges better than any ranking.
+        detail_chars = max_chars - _SEARCH_MORE_CHARS if max_chars else None
         for hit in hits:
             if len(results) == limit:
                 break
@@ -1068,15 +1089,36 @@ class Journal:
                       "exchanges": [{"index": index, "events": events, "events_total": len(group)}],
                       "read_more": {"tool": "read_conversation", "start": index, "limit": 1, "messages_only": True}}
             cost = len(json.dumps(result, ensure_ascii=False))
-            if results and max_chars and used + cost > max_chars:
+            if results and detail_chars and used + cost > detail_chars:
                 omitted += 1
                 continue
             seen.add((*chat, index))
             per_chat[chat] = per_chat.get(chat, 0) + 1
             results.append(result)
             used += cost
-        return {"matching_chats": chats, "results": results, "omitted_results": omitted,
-                "searched_words": terms, "searched_by_meaning": bool(meaning)}
+        shown = {e["id"] for r in results for x in r["exchanges"] for e in x["events"]}
+        titles = {(c["source"], c["session_id"]): c["title"] for c in chats}
+        more, more_chars = [], 0
+        for hit in hits if max_chars else []:  # Includes matches left out above for space or the per-chat limit.
+            if len(more) == _SEARCH_MORE_COUNT or hit["id"] in shown:
+                continue
+            text = hit["content"] or ""
+            start = hit.get("passage_start", best_window(text, terms, _SEARCH_SNIPPET_CHARS) if len(text) > _SEARCH_SNIPPET_CHARS else 0)
+            snippet = " ".join(text[start:start + _SEARCH_SNIPPET_CHARS].split())
+            item = {"event_id": hit["id"], "kind": hit["kind"], "time": (hit["timestamp"] or "")[:16],
+                    "chat": (titles.get((hit["source"], hit["session_id"])) or "")[:60], "snippet": snippet}
+            cost = len(json.dumps(item, ensure_ascii=False))
+            if used + more_chars + cost > max_chars:
+                break
+            shown.add(hit["id"])
+            more.append(item)
+            more_chars += cost
+        found = {"matching_chats": chats, "results": results, "omitted_results": omitted,
+                 "searched_words": terms, "searched_by_meaning": bool(meaning)}
+        if more:
+            found["more_matches"] = more
+            found["open_more"] = "read_conversation with project and event_id returns that match's whole exchange"
+        return found
 
     def projects(self) -> list[dict]:
         return [dict(row) for row in self.db.execute(
@@ -1235,6 +1277,9 @@ _MCP_PAGE_CHARS = 60000
 _MCP_SEARCH_CHARS = 24000
 _SEARCH_TITLE_CHARS = 120
 _SEARCH_EVENT_CHARS = 1500
+_SEARCH_MORE_CHARS = 7000   # Room in a search result for further matches as short snippets.
+_SEARCH_MORE_COUNT = 25
+_SEARCH_SNIPPET_CHARS = 220
 
 
 _STOP_WORDS = set("""a about after again all also am an and any are as at be been before being both but by can could
@@ -1410,9 +1455,9 @@ def mcp_response(request: dict, journal: Journal) -> dict | None:
              "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}, "source": {"type": "string"}, "session_id": {"type": "string"}, "kind": {"type": "string", "enum": ["goal", "accepted_decision", "correction", "rejected_approach", "request"]}, "text": {"type": "string"}, "evidence": {"type": "array", "items": {"type": "object", "properties": {"event_id": {"type": "string"}, "quote": {"type": "string"}}, "required": ["event_id", "quote"]}}, "supersedes": {"type": "array", "items": {"type": "string"}}, "conflicts_with": {"type": "array", "items": {"type": "string"}}}, "required": ["project", "source", "session_id", "kind", "text", "evidence"]}},
             {"name": "conversations", "description": "List all imported project conversations and their relationships; selection is optional.",
              "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}}, "required": ["project"]}},
-            {"name": "read_conversation", "description": "Read ordered exchanges without shortening messages. Large pages end early; continue with next_start. Set messages_only to skip tool output.",
-             "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}, "source": {"type": "string"}, "session_id": {"type": "string"}, "start": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 50}, "messages_only": {"type": "boolean"}}, "required": ["project", "source", "session_id"]}},
-            {"name": "search_context", "description": "Search all project chats by words and, when installed, by meaning. Each result is the matching passage with the request it answered and the final reply. One wording often misses: when the first search does not answer the question, search again with 2-3 different wordings, such as the exact names, file names or error text likely used at the time, and plain synonyms.",
+            {"name": "read_conversation", "description": "Read ordered exchanges without shortening messages. Large pages end early; continue with next_start. Set messages_only to skip tool output. With event_id instead of source and session_id, returns the exchange holding that event, such as one listed in a search's more_matches.",
+             "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}, "source": {"type": "string"}, "session_id": {"type": "string"}, "event_id": {"type": "string"}, "start": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 50}, "messages_only": {"type": "boolean"}}, "required": ["project"]}},
+            {"name": "search_context", "description": "Search all project chats by words and, when installed, by meaning. Each result is the matching passage with the request it answered and the final reply; more_matches lists further matches as short snippets, and read_conversation with an event_id opens one. If the results do not answer the question, check more_matches before searching again. One wording often misses: when the first search does not answer the question, search again with 2-3 different wordings, such as the exact names, file names or error text likely used at the time, and plain synonyms.",
              "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}, "query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["project", "query"]}},
             {"name": "capture", "description": "Synchronize every matching local conversation and summarize capture coverage.",
              "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}}, "required": ["project"]}},
@@ -1469,6 +1514,9 @@ def mcp_response(request: dict, journal: Journal) -> dict | None:
                             args["evidence"], args.get("supersedes"), args.get("conflicts_with"))
         elif name == "conversations":
             data = {"conversations": journal.conversations(project)}
+        elif name == "read_conversation" and args.get("event_id"):
+            data = journal.read_exchange_of(project, str(args["event_id"]), messages_only=args.get("messages_only", True) is not False,
+                                            max_chars=_MCP_PAGE_CHARS)
         elif name == "read_conversation":
             data = journal.read_conversation(project, args["source"], args["session_id"], int(args.get("start", 0)), int(args.get("limit", 5)),
                                              messages_only=bool(args.get("messages_only")), max_chars=_MCP_PAGE_CHARS)

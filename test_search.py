@@ -84,3 +84,20 @@ def test_a_long_chat_can_give_three_results(tmp_path):
     add(journal, project, "c1", items)
     found = journal.search_context(project, "holdout accuracy", limit=5, max_chars=24000)
     assert len(found["results"]) == 3
+
+
+def test_matches_that_do_not_fit_are_listed_as_snippets_and_can_be_opened(tmp_path):
+    journal = Journal(tmp_path / "j.db")
+    project = tmp_path / "p"
+    project.mkdir()
+    for n in range(12):
+        add(journal, project, f"s{n}", [("user_message", f"deploy question {n} " + "filler " * 300),
+                                        ("assistant_message", f"deploy answer {n} " + "detail " * 300, {"phase": "final_answer"})],
+            day=f"2026-03-{n + 1:02d}")
+    found = journal.search_context(project, "deploy", limit=5, max_chars=24000)
+    assert len(json.dumps(found, ensure_ascii=False)) <= 24000 + 2000
+    listed = found["more_matches"]
+    shown = {e["id"] for r in found["results"] for x in r["exchanges"] for e in x["events"]}
+    assert listed and not shown & {m["event_id"] for m in listed}
+    opened = journal.read_exchange_of(project, listed[0]["event_id"])
+    assert any(e["id"] == listed[0]["event_id"] for x in opened["exchanges"] for e in x["events"])

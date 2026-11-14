@@ -286,6 +286,22 @@ fastest model stays. Search takes about 2.3 s on this journal against 1.7 s with
 the first search in a session takes about 8 s while the model and vectors load, which the
 background indexer does in advance. Timings are from one Windows laptop processor.
 
+### Duplicates, a match list and rerankers — 2026-11-14
+
+A second set of 30 questions was written by Haiku from randomly chosen Codex exchanges that
+had not been looked at while tuning; each answer text was checked to appear in the Codex file.
+
+| Change | First 29 | New 30 |
+| --- | --- | --- |
+| Meaning search, 4 wordings | 21 | — |
+| + same message stored twice shown once | 22 | 23 |
+| + room kept for a list of further matches (main results only) | 21 | 23 |
+| + Haiku opens up to 3 listed matches with read_conversation | 22 | 27 |
+| jina-reranker-v1-tiny re-ordering the top 40 instead | 20 | 24 |
+
+The reranker added about 3.3 s per search (7.1 s at worst) and lost a question on the first
+set, so it was not adopted. Haiku's choices for both sets cost about $0.034.
+
 ## Limits of this verification
 
 Live matching history was Codex history. Cursor, Claude, and Muse parsing has fixture
