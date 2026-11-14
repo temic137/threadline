@@ -583,6 +583,7 @@ class Journal:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path, self._meaning = path, None
+        self._outlines = {}  # Recently searched chats: change count -> exchanges as (id, kind, phase).
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -806,6 +807,25 @@ class Journal:
             else:
                 joined.append(group)
         return joined
+
+    def _search_outline(self, project: Path, source: str, session_id: str):
+        """Exchanges of a chat as small tuples, kept for the next searches until the chat changes."""
+        key = (str(project.resolve()), source, session_id)
+        stamp = self.db.execute("SELECT version FROM chat_versions WHERE project=? AND source=? AND session_id=?", key).fetchone()
+        cached = self._outlines.pop(key, None)
+        if not cached or cached[0] != stamp:
+            groups = [[(e["id"], e["kind"], e["metadata"].get("phase")) for e in group]
+                      for group in self.exchanges(project, source, session_id, with_content=False)]
+            cached = (stamp, groups, {event[0]: index for index, group in enumerate(groups) for event in group})
+        self._outlines[key] = cached
+        while len(self._outlines) > _SEARCH_OUTLINES:
+            self._outlines.pop(next(iter(self._outlines)))
+        return cached[1], cached[2]
+
+    def _events_by_id(self, ids: list[str]) -> list[dict]:
+        rows = {row["id"]: dict(row) | {"metadata": json.loads(row["metadata"])}
+                for row in self.db.execute(f"SELECT * FROM events WHERE id IN ({','.join('?' * len(ids))})", ids)}
+        return [rows[event_id] for event_id in ids if event_id in rows]
 
     def hydrate(self, events: list[dict]) -> list[dict]:
         """Load content for events from an outline, keeping their order."""
@@ -1054,7 +1074,7 @@ class Journal:
             # Titles can be whole pasted documents, and the list counts towards the limit.
             chats = [{**chat, "title": chat["title"][:_SEARCH_TITLE_CHARS]} for chat in chats]
         terms = query_terms(query)
-        results, seen, per_chat, outlines = [], set(), {}, {}
+        results, seen, per_chat, outlines, displayed = [], set(), {}, {}, set()
         used, omitted = len(json.dumps(chats, ensure_ascii=False)) if max_chars else 0, 0
         # Space is kept for a list of further matches, which the agent judges better than any ranking.
         detail_chars = max_chars - _SEARCH_MORE_CHARS if max_chars else None
@@ -1064,18 +1084,23 @@ class Journal:
             chat = (hit["source"], hit["session_id"])
             if per_chat.get(chat, 0) == 3:
                 continue
+            length = len(hit["content"] or "")
+            shortest = length if length <= _SEARCH_EVENT_CHARS else min(length - hit.get("passage_start", 0), _SEARCH_EVENT_CHARS)
+            if results and detail_chars and used + shortest + 300 > detail_chars:
+                omitted += hit["id"] not in displayed  # Cannot fit even as the matching passage alone, so the chat need not be read.
+                continue
             if chat not in outlines:
-                outlines[chat] = self.exchanges(project, *chat, with_content=False)
-            groups = outlines[chat]
-            index = next((i for i, group in enumerate(groups) if any(e["id"] == hit["id"] for e in group)), None)
+                outlines[chat] = self._search_outline(project, *chat)
+            groups, where = outlines[chat]
+            index = where.get(hit["id"])
             if index is None or (*chat, index) in seen:
                 continue
             group = groups[index]
-            request = next((e for e in group if e["kind"] == "user_message"), None)
-            replies = [e for e in group if e["kind"] == "assistant_message"]
-            finals = [e for e in replies if e["metadata"].get("phase") == "final_answer"] or replies
-            keep = {e["id"] for e in (request, hit, finals[-1] if finals else None) if e}
-            events = self.hydrate([e for e in group if e["id"] in keep])
+            request = next((e for e in group if e[1] == "user_message"), None)
+            replies = [e for e in group if e[1] == "assistant_message"]
+            finals = [e for e in replies if e[2] == "final_answer"] or replies
+            keep = {request[0] if request else None, hit["id"], finals[-1][0] if finals else None}
+            events = self._events_by_id([e[0] for e in group if e[0] in keep])
             for event in events:
                 if max_chars and len(event["content"]) > _SEARCH_EVENT_CHARS:
                     full = len(event["content"])
@@ -1095,6 +1120,7 @@ class Journal:
             seen.add((*chat, index))
             per_chat[chat] = per_chat.get(chat, 0) + 1
             results.append(result)
+            displayed.update(e["id"] for e in events)
             used += cost
         shown = {e["id"] for r in results for x in r["exchanges"] for e in x["events"]}
         titles = {(c["source"], c["session_id"]): c["title"] for c in chats}
@@ -1193,6 +1219,23 @@ class Journal:
                 INSERT INTO events_fts(events_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
                 INSERT INTO events_fts(rowid, content) VALUES (new.rowid, new.content);
             END;
+            -- Counts changes to each chat, so search can keep a chat's outline until the chat changes.
+            CREATE TABLE IF NOT EXISTS chat_versions (project TEXT, source TEXT, session_id TEXT, version INTEGER,
+                                                      PRIMARY KEY (project, source, session_id));
+            CREATE TRIGGER IF NOT EXISTS chat_versions_insert AFTER INSERT ON events BEGIN
+                INSERT INTO chat_versions VALUES (new.project, new.source, new.session_id, 1)
+                    ON CONFLICT DO UPDATE SET version = version + 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS chat_versions_delete AFTER DELETE ON events BEGIN
+                INSERT INTO chat_versions VALUES (old.project, old.source, old.session_id, 1)
+                    ON CONFLICT DO UPDATE SET version = version + 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS chat_versions_update AFTER UPDATE ON events BEGIN
+                INSERT INTO chat_versions VALUES (old.project, old.source, old.session_id, 1)
+                    ON CONFLICT DO UPDATE SET version = version + 1;
+                INSERT INTO chat_versions VALUES (new.project, new.source, new.session_id, 1)
+                    ON CONFLICT DO UPDATE SET version = version + 1;
+            END;
         """)
         if created:
             self.db.commit()
@@ -1277,6 +1320,7 @@ _MCP_PAGE_CHARS = 60000
 _MCP_SEARCH_CHARS = 24000
 _SEARCH_TITLE_CHARS = 120
 _SEARCH_EVENT_CHARS = 1500
+_SEARCH_OUTLINES = 32
 _SEARCH_MORE_CHARS = 7000   # Room in a search result for further matches as short snippets.
 _SEARCH_MORE_COUNT = 25
 _SEARCH_SNIPPET_CHARS = 220
@@ -1301,12 +1345,19 @@ def best_window(text: str, terms: list[str], width: int) -> int:
     """Where a passage of the given width covers the most different query words."""
     lower = text.lower()
     spots = sorted((m.start(), term) for term in terms for m in re.finditer(r"\b" + re.escape(term) + r"\b", lower))
-    best, best_count = 0, -1
-    for position, _ in spots:
+    best, best_count, inside, low, high = 0, -1, {}, 0, 0
+    for position, _ in spots:  # Window starts only move forward, so one pass with two pointers is enough.
         start = max(0, min(position - width // 4, len(text) - width))
-        count = len({term for spot, term in spots if start <= spot < start + width})
-        if count > best_count:
-            best, best_count = start, count
+        while high < len(spots) and spots[high][0] < start + width:
+            inside[spots[high][1]] = inside.get(spots[high][1], 0) + 1
+            high += 1
+        while spots[low][0] < start:
+            inside[spots[low][1]] -= 1
+            if not inside[spots[low][1]]:
+                del inside[spots[low][1]]
+            low += 1
+        if len(inside) > best_count:
+            best, best_count = start, len(inside)
     return best
 
 

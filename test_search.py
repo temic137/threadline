@@ -101,3 +101,17 @@ def test_matches_that_do_not_fit_are_listed_as_snippets_and_can_be_opened(tmp_pa
     assert listed and not shown & {m["event_id"] for m in listed}
     opened = journal.read_exchange_of(project, listed[0]["event_id"])
     assert any(e["id"] == listed[0]["event_id"] for x in opened["exchanges"] for e in x["events"])
+
+
+def test_a_chat_that_grows_between_searches_is_read_again(tmp_path):
+    journal = Journal(tmp_path / "j.db")
+    project = tmp_path / "p"
+    project.mkdir()
+    first = [("user_message", "which database viewer do we use?"),
+             ("assistant_message", "DBeaver for the database.", {"phase": "final_answer"})]
+    add(journal, project, "c1", first)
+    assert journal.search_context(project, "database viewer", max_chars=24000)["results"][0]["total_exchanges"] == 1
+    add(journal, project, "c1", first + [("user_message", "and which parser for the statements?"),
+                                         ("assistant_message", "pdfplumber parses the statements.", {"phase": "final_answer"})])
+    found = journal.search_context(project, "parser statements", max_chars=24000)
+    assert "pdfplumber" in shown(found) and found["results"][0]["total_exchanges"] == 2

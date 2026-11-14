@@ -314,6 +314,19 @@ Smaller search replies were tried to save tokens (the match list's share scaled 
 The 24,000 limit stays. Comparing the question with all 40,669 stored passages takes about 6 ms
 of a 3–12 s search, so clustering the vectors (k-means style indexes) would not make it faster.
 
+The time went into building the reply: each search read about 18 whole chats (some with ~5,500
+events) to find the exchange around each match, and kept reading after its space was full.
+Search now skips matches that cannot fit, keeps a small outline of up to 32 recently searched
+chats until a chat changes (a per-chat change count kept by database triggers), and finds the
+best passage in one pass. On 6 questions × 4 wordings the replies were identical to before
+apart from the left-out count:
+
+| | Before | After |
+| --- | --- | --- |
+| First search | 11–13 s | 3.2 s |
+| Each further wording | 10–11 s | 2.2 s |
+| Slowest | 13–15 s | 6.8 s |
+
 ## Limits of this verification
 
 Live matching history was Codex history. Cursor, Claude, and Muse parsing has fixture
