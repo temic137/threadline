@@ -222,3 +222,55 @@ def test_wheel_contains_capture_module_and_runs_outside_checkout(tmp_path):
                             env=env, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["conversations_captured"] == 0
+
+
+def test_old_archive_layout_moves_to_numbered_sources_without_loss(tmp_path):
+    from handoff_capture import initialize
+    from handoff_sessions import Journal
+    journal = Journal(tmp_path / "j.db")
+    try:
+        journal.db.executescript("""
+            CREATE TABLE capture_records (project TEXT, source TEXT, session_id TEXT, location TEXT,
+                record_key TEXT, digest TEXT, payload TEXT, redacted INTEGER,
+                PRIMARY KEY(project, source, session_id, location, record_key, digest));
+            CREATE TABLE capture_event_links (project TEXT, source TEXT, session_id TEXT, location TEXT, event_id TEXT,
+                PRIMARY KEY(project, source, session_id, location, event_id));
+        """)
+        records = [("/p", "codex", "A", "/long/path/a.jsonl", f"line:{n}", f"d{n}", '{"text": "hello %d"}' % n, 0) for n in range(3)]
+        records.append(("/p", "claude", "B", "/long/path/b.jsonl", "line:0", "d0", "plain text", 1))
+        links = [("/p", "codex", "A", "/long/path/a.jsonl", f"e{n}") for n in range(3)] + [("/p", "claude", "B", "/long/path/b.jsonl", "e9")]
+        journal.db.executemany("INSERT INTO capture_records VALUES (?,?,?,?,?,?,?,?)", records)
+        journal.db.executemany("INSERT INTO capture_event_links VALUES (?,?,?,?,?)", links)
+        journal.db.commit()
+
+        initialize(journal.db)
+        initialize(journal.db)  # Running again changes nothing.
+
+        kinds = dict(journal.db.execute("SELECT name, type FROM sqlite_master WHERE name IN ('capture_records','capture_event_links')").fetchall())
+        assert kinds == {"capture_records": "view", "capture_event_links": "view"}
+        assert sorted(tuple(r) for r in journal.db.execute("SELECT * FROM capture_records")) == sorted(records)
+        assert sorted(tuple(r) for r in journal.db.execute("SELECT * FROM capture_event_links")) == sorted(links)
+        assert journal.db.execute("SELECT count(*) FROM capture_sources").fetchone()[0] == 2
+        assert isinstance(journal.db.execute("SELECT payload FROM capture_archive").fetchone()[0], bytes)
+
+        journal.delete(Path("/p"), "A")
+        assert journal.db.execute("SELECT count(*) FROM capture_records").fetchone()[0] == 1
+        assert journal.db.execute("SELECT count(*) FROM capture_event_links").fetchone()[0] == 1
+    finally:
+        journal.close()
+
+
+def test_compact_shrinks_the_file_and_keeps_history(tmp_path):
+    from handoff_sessions import Journal, make_event
+    journal = Journal(tmp_path / "j.db")
+    try:
+        events = [make_event("codex", "A", n, "user_message", "user", "word " * 2000, "2026-01-01T00:00:00Z", {}) for n in range(200)]
+        journal.import_session({"id": "A", "source": "codex", "project": str(tmp_path), "path": "x", "updated": "2026-01-01", "events": events})
+        journal.db.execute("DELETE FROM events WHERE ordinal >= 10")
+        journal.db.commit()
+        before, after = journal.compact()
+        assert after < before / 4
+        assert journal.db.execute("SELECT count(*) FROM events").fetchone()[0] == 10
+        assert journal.db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        journal.close()

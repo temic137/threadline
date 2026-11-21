@@ -486,6 +486,24 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError, sqlite3.Error) as exc:
             print(f"Transfer failed: {type(exc).__name__}. No destination loading has been verified.")
             return 1
+    if argv and argv[0] == "compact":
+        command = argparse.ArgumentParser(prog="handoff compact", description="Shrink the journal file on disk. Close agent apps that use handoff first.")
+        command.add_argument("--db")
+        options = command.parse_args(argv[1:])
+        path = Path(options.db).resolve() if options.db else default_db
+        if not path.exists():
+            print("No journal found.")
+            return 1
+        journal = Journal(path)
+        try:
+            before, after = journal.compact()
+        except sqlite3.OperationalError as exc:
+            print(f"Compact stopped: {exc}. Close agent apps that use handoff and try again.")
+            return 1
+        finally:
+            journal.close()
+        print(f"Journal: {before / 1048576:.0f} MB before, {after / 1048576:.0f} MB after.")
+        return 0
     if argv and argv[0] == "configure":
         from handoff_typellm import configure as configure_typellm
         command = argparse.ArgumentParser(prog="handoff configure")

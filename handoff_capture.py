@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import zlib
 from pathlib import Path
 from collections import Counter
 from contextlib import closing
@@ -167,24 +168,56 @@ def codex_sqlite_conversations(state_path, history_path, project, selected=None,
                 history.close()
 
 
+def deflate(text):
+    return None if text is None else zlib.compress(text.encode(), 6)
+
+
+def inflate(blob):
+    return blob.decode() if isinstance(blob, str) else None if blob is None else zlib.decompress(blob).decode()
+
+
+def register_functions(db):
+    db.create_function("handoff_inflate", 1, inflate, deterministic=True)
+    db.create_function("handoff_deflate", 1, deflate, deterministic=True)
+
+
+def source_id(db, identity):
+    """The number that stands for one (project, source, session, location) in the archive and links."""
+    db.execute("INSERT OR IGNORE INTO capture_sources(project,source,session_id,location) VALUES (?,?,?,?)", identity)
+    return db.execute("SELECT id FROM capture_sources WHERE project=? AND source=? AND session_id=? AND location=?",
+                      identity).fetchone()[0]
+
+
+def delete_sources(db, clause, params):
+    """Remove archive rows and links for the matching sources; clause uses project/source/session_id/location."""
+    ids = f"SELECT id FROM capture_sources WHERE {clause}"
+    db.execute(f"DELETE FROM capture_archive WHERE src IN ({ids})", params)
+    db.execute(f"DELETE FROM capture_links WHERE src IN ({ids})", params)
+
+
 def initialize(db):
+    register_functions(db)
+    # Paths and chat ids are stored once in capture_sources; the archive is compressed. The old
+    # capture_records and capture_event_links names stay readable as views.
     db.executescript("""
-        CREATE TABLE IF NOT EXISTS capture_records (
-            project TEXT, source TEXT, session_id TEXT, location TEXT,
-            record_key TEXT, digest TEXT, payload TEXT, redacted INTEGER,
-            PRIMARY KEY(project, source, session_id, location, record_key, digest)
+        CREATE TABLE IF NOT EXISTS capture_sources (
+            id INTEGER PRIMARY KEY, project TEXT, source TEXT, session_id TEXT, location TEXT,
+            UNIQUE(project, source, session_id, location)
         );
+        CREATE TABLE IF NOT EXISTS capture_archive (
+            src INTEGER, record_key TEXT, digest TEXT, payload BLOB, redacted INTEGER
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS capture_archive_key ON capture_archive(src, record_key, digest);
+        CREATE TABLE IF NOT EXISTS capture_links (
+            src INTEGER, event_id TEXT, PRIMARY KEY(src, event_id)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS capture_links_event ON capture_links(event_id);
         CREATE TABLE IF NOT EXISTS capture_state (
             project TEXT, source TEXT, session_id TEXT, location TEXT,
             digest TEXT, details TEXT,
             PRIMARY KEY(project, source, session_id, location)
         );
         CREATE TABLE IF NOT EXISTS capture_reports (project TEXT PRIMARY KEY, report TEXT);
-        CREATE TABLE IF NOT EXISTS capture_event_links (
-            project TEXT, source TEXT, session_id TEXT, location TEXT, event_id TEXT,
-            PRIMARY KEY(project, source, session_id, location, event_id)
-        );
-        CREATE INDEX IF NOT EXISTS capture_event_links_event_location ON capture_event_links(event_id,location);
         CREATE TABLE IF NOT EXISTS journal_meta (key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE IF NOT EXISTS capture_snapshots (
             project TEXT, source TEXT, session_id TEXT, location TEXT, digest TEXT,
@@ -192,7 +225,39 @@ def initialize(db):
             PRIMARY KEY(project, source, session_id, location, digest)
         );
     """)
+    migrate_archive(db)
+    db.executescript("""
+        CREATE VIEW IF NOT EXISTS capture_records AS
+            SELECT s.project, s.source, s.session_id, s.location, a.record_key, a.digest,
+                   handoff_inflate(a.payload) AS payload, a.redacted
+            FROM capture_archive a JOIN capture_sources s ON s.id=a.src;
+        CREATE VIEW IF NOT EXISTS capture_event_links AS
+            SELECT s.project, s.source, s.session_id, s.location, l.event_id
+            FROM capture_links l JOIN capture_sources s ON s.id=l.src;
+    """)
     scrub_journal(db)
+
+
+def migrate_archive(db):
+    """Move journals written before capture_sources into the smaller layout, once."""
+    tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "capture_records" not in tables and "capture_event_links" not in tables:
+        return
+    with db:
+        for old in ("capture_records", "capture_event_links"):
+            if old in tables:
+                db.execute(f"""INSERT OR IGNORE INTO capture_sources(project,source,session_id,location)
+                               SELECT DISTINCT project,source,session_id,location FROM {old}""")
+        if "capture_records" in tables:
+            db.execute("""INSERT OR IGNORE INTO capture_archive
+                          SELECT s.id, r.record_key, r.digest, handoff_deflate(r.payload), r.redacted
+                          FROM capture_records r JOIN capture_sources s USING(project,source,session_id,location)""")
+            db.execute("DROP TABLE capture_records")
+        if "capture_event_links" in tables:
+            db.execute("""INSERT OR IGNORE INTO capture_links
+                          SELECT s.id, l.event_id
+                          FROM capture_event_links l JOIN capture_sources s USING(project,source,session_id,location)""")
+            db.execute("DROP TABLE capture_event_links")
 
 
 def scrub_journal(db):
@@ -202,7 +267,7 @@ def scrub_journal(db):
     if row and int(row[0]) >= REDACTION_VERSION:
         return
     tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type IN ('table','view')")}
-    targets = {"events": ("content", "metadata"), "capture_records": ("payload",), "capture_state": ("details",),
+    targets = {"events": ("content", "metadata"), "capture_archive": ("payload",), "capture_state": ("details",),
                "capture_reports": ("report",), "decision_annotations": ("payload",)}
     plain_text = {"content"}
 
@@ -224,8 +289,12 @@ def scrub_journal(db):
             if table not in tables:
                 continue
             for rowid, *values in db.execute(f"SELECT rowid,{','.join(columns)} FROM {table}").fetchall():
+                if table == "capture_archive":
+                    values = [inflate(value) for value in values]
                 cleaned = [cleaned_value(column, value) for column, value in zip(columns, values)]
                 if cleaned != values:
+                    if table == "capture_archive":
+                        cleaned = [deflate(value) for value in cleaned]
                     assignment = ",".join(column + "=?" for column in columns)
                     db.execute(f"UPDATE {table} SET {assignment} WHERE rowid=?", (*cleaned, rowid))
         db.execute("INSERT OR REPLACE INTO journal_meta VALUES ('redaction_version',?)", (str(REDACTION_VERSION),))
@@ -724,22 +793,24 @@ def synchronize(journal, project, home, source="auto", selected=None, reread=Fal
                     if compressed:
                         # Codex compressed this file after an earlier capture; this replaces those rows.
                         earlier = (str(project), kind, sid, str(path.with_suffix("").resolve()))
-                        for (event_id,) in journal.db.execute("SELECT event_id FROM capture_event_links WHERE project=? AND source=? AND session_id=? AND location=?", earlier).fetchall():
+                        earlier_src = source_id(journal.db, earlier)
+                        for (event_id,) in journal.db.execute("SELECT event_id FROM capture_links WHERE src=?", (earlier_src,)).fetchall():
                             journal.db.execute("DELETE FROM events WHERE id=?", (event_id,))
-                        journal.db.execute("DELETE FROM capture_event_links WHERE project=? AND source=? AND session_id=? AND location=?", earlier)
+                        journal.db.execute("DELETE FROM capture_links WHERE src=?", (earlier_src,))
                         journal.db.execute("DELETE FROM capture_state WHERE project=? AND source=? AND session_id=? AND location=?", earlier)
                     manifest = []
+                    src = source_id(journal.db, identity)
                     for key, payload, record_digest, redacted in clean_rows:
                         details["redacted_records"] += int(redacted)
                         manifest.append([key, record_digest])
-                        inserted = journal.db.execute("INSERT OR IGNORE INTO capture_records VALUES (?,?,?,?,?,?,?,?)",
-                                                      (*identity, key, record_digest, payload, int(redacted)))
+                        inserted = journal.db.execute("INSERT OR IGNORE INTO capture_archive VALUES (?,?,?,?,?)",
+                                                      (src, key, record_digest, deflate(payload), int(redacted)))
                         new_records += inserted.rowcount
                     if not conflict and details["status"] != "unchanged" and not any("Normalization failed" in gap for gap in gaps):
                         old_ids = {r[0] for r in journal.db.execute("""SELECT e.id FROM events e
                             WHERE e.project=? AND e.source=? AND e.session_id=? AND (
-                                EXISTS (SELECT 1 FROM capture_event_links l WHERE l.event_id=e.id AND l.location=?)
-                                OR NOT EXISTS (SELECT 1 FROM capture_event_links l WHERE l.event_id=e.id))""", identity)}
+                                EXISTS (SELECT 1 FROM capture_links l WHERE l.event_id=e.id AND l.src=?)
+                                OR NOT EXISTS (SELECT 1 FROM capture_links l WHERE l.event_id=e.id))""", (*identity[:3], src))}
                         new_ids = {e["id"] for e in captured["events"]}
                         new_events = len(new_ids - old_ids)
                         for event_id in old_ids - new_ids:
@@ -748,9 +819,9 @@ def synchronize(journal, project, home, source="auto", selected=None, reread=Fal
                         # An event read before keeps its id, but may now belong in a different place.
                         journal.db.executemany("UPDATE events SET metadata=? WHERE id=?",
                                                [(json.dumps(e["metadata"], ensure_ascii=False), e["id"]) for e in captured["events"]])
-                        journal.db.execute("DELETE FROM capture_event_links WHERE project=? AND source=? AND session_id=? AND location=?", identity)
-                        journal.db.executemany("INSERT OR IGNORE INTO capture_event_links VALUES (?,?,?,?,?)",
-                                               [(*identity, event_id) for event_id in new_ids])
+                        journal.db.execute("DELETE FROM capture_links WHERE src=?", (src,))
+                        journal.db.executemany("INSERT OR IGNORE INTO capture_links VALUES (?,?)",
+                                               [(src, event_id) for event_id in new_ids])
                     journal.db.execute("INSERT OR IGNORE INTO capture_snapshots VALUES (?,?,?,?,?,?,?)",
                                        (*identity, digest, report["captured_at"], json.dumps(manifest)))
                     journal.db.execute("INSERT OR REPLACE INTO capture_state VALUES (?,?,?,?,?,?)",

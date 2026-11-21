@@ -588,6 +588,10 @@ class Journal:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=5000")
+        # After each checkpoint the write-ahead log is cut back, so it never stays at its largest size.
+        self.db.execute("PRAGMA journal_size_limit=16777216")
+        from handoff_capture import register_functions
+        register_functions(self.db)  # The capture_records view reads compressed rows through these.
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT, source TEXT, project TEXT, source_path TEXT, updated TEXT,
@@ -612,6 +616,20 @@ class Journal:
 
     def close(self):
         self.db.close()
+
+    def size(self) -> int:
+        return sum(p.stat().st_size for p in (self.path, Path(f"{self.path}-wal")) if p.exists())
+
+    def compact(self) -> tuple[int, int]:
+        """Move an old journal to the current layout and give free space back to the disk.
+        Returns the file size in bytes before and after."""
+        from handoff_capture import initialize
+        before = self.size()
+        initialize(self.db)
+        self.db.commit()
+        self.db.execute("VACUUM")
+        self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return before, self.size()
 
     @property
     def meaning(self):
@@ -1176,7 +1194,9 @@ class Journal:
         delete_vectors(self.db, project_value, session_id)
         ids = [row[0] for row in self.db.execute(f"SELECT id FROM events WHERE {clause}", params)]
         self.db.execute(f"DELETE FROM events WHERE {clause}", params)
-        for table in ("capture_records", "capture_state", "capture_event_links", "capture_snapshots", "decision_annotations"):
+        from handoff_capture import delete_sources
+        delete_sources(self.db, clause, params)
+        for table in ("capture_sources", "capture_state", "capture_snapshots", "decision_annotations"):
             self.db.execute(f"DELETE FROM {table} WHERE {clause}", params)
         self.db.execute("DELETE FROM capture_reports WHERE project=?", (project_value,))
         if session_id:
