@@ -236,7 +236,7 @@ def test_old_archive_layout_moves_to_numbered_sources_without_loss(tmp_path):
             CREATE TABLE capture_event_links (project TEXT, source TEXT, session_id TEXT, location TEXT, event_id TEXT,
                 PRIMARY KEY(project, source, session_id, location, event_id));
         """)
-        records = [("/p", "codex", "A", "/long/path/a.jsonl", f"line:{n}", f"d{n}", '{"text": "hello %d"}' % n, 0) for n in range(3)]
+        records = [("/p", "codex", "A", "/long/path/a.jsonl", f"line:{n}", f"d{n}", '{"text": "hello %d %s"}' % (n, "x" * 80), 0) for n in range(3)]
         records.append(("/p", "claude", "B", "/long/path/b.jsonl", "line:0", "d0", "plain text", 1))
         links = [("/p", "codex", "A", "/long/path/a.jsonl", f"e{n}") for n in range(3)] + [("/p", "claude", "B", "/long/path/b.jsonl", "e9")]
         journal.db.executemany("INSERT INTO capture_records VALUES (?,?,?,?,?,?,?,?)", records)
@@ -251,7 +251,8 @@ def test_old_archive_layout_moves_to_numbered_sources_without_loss(tmp_path):
         assert sorted(tuple(r) for r in journal.db.execute("SELECT * FROM capture_records")) == sorted(records)
         assert sorted(tuple(r) for r in journal.db.execute("SELECT * FROM capture_event_links")) == sorted(links)
         assert journal.db.execute("SELECT count(*) FROM capture_sources").fetchone()[0] == 2
-        assert isinstance(journal.db.execute("SELECT payload FROM capture_archive").fetchone()[0], bytes)
+        stored = dict(journal.db.execute("SELECT record_key, payload FROM capture_archive a JOIN capture_sources s ON s.id=a.src WHERE s.source='codex'").fetchall())
+        assert all(isinstance(value, bytes) for value in stored.values())  # Long values are compressed.
 
         journal.delete(Path("/p"), "A")
         assert journal.db.execute("SELECT count(*) FROM capture_records").fetchone()[0] == 1
@@ -333,5 +334,77 @@ def test_old_journal_is_slimmed_on_first_open(tmp_path):
         stored = [row[0] for row in journal.db.execute("SELECT content FROM events ORDER BY ordinal")]
         assert stored[0] == output and all(s.startswith("[Same output as earlier tool result") for s in stored[1:])
         assert journal.db.execute("SELECT value FROM journal_meta WHERE key='slim_version'").fetchone()[0] == "1"
+    finally:
+        journal.close()
+
+
+def _plain_journal_with_history(path, count):
+    """A journal as written before events_data: messages as plain text in an events table."""
+    import sqlite3
+    db = sqlite3.connect(path)
+    db.executescript("""
+        CREATE TABLE events (id TEXT PRIMARY KEY, session_id TEXT, source TEXT, project TEXT,
+            ordinal INTEGER, timestamp TEXT, kind TEXT, actor TEXT, content TEXT, metadata TEXT);
+        CREATE VIRTUAL TABLE events_fts USING fts5(content, content='events', content_rowid='rowid');
+    """)
+    rows = [(f"e{n}", "S", "codex", str(path.parent), n, f"2026-01-01T00:{n // 60 % 60:02d}:{n % 60:02d}Z",
+             "tool_result", "tool", f"Output {n}: the build finished with {n % 7} warnings in module_{n % 13}.py " * 3,
+             json.dumps({"source_path": "/Users/me/.codex/sessions/rollout-2026-01-01.jsonl", "capture_order": n}))
+            for n in range(count)]
+    db.executemany("INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+    db.execute("INSERT INTO events_fts(events_fts) VALUES ('rebuild')")
+    db.commit()
+    db.close()
+    return rows
+
+
+def test_plain_events_move_to_compressed_storage_and_stay_searchable(tmp_path):
+    from handoff_sessions import Journal
+    rows = _plain_journal_with_history(tmp_path / "j.db", 1500)
+    journal = Journal(tmp_path / "j.db")
+    try:
+        assert journal.db.execute("SELECT type FROM sqlite_master WHERE name='events'").fetchone()[0] == "view"
+        assert sorted(journal.codec.latest) == ["content", "metadata"]
+        stored = journal.db.execute("SELECT content, metadata FROM events_data WHERE id='e5'").fetchone()
+        assert isinstance(stored[0], bytes) and isinstance(stored[1], bytes)
+        assert [tuple(r) for r in journal.db.execute("SELECT * FROM events ORDER BY ordinal")] == rows
+        if journal.fts:
+            found = journal.search(tmp_path, "module_12.py")
+            assert found and all("module_12.py" in e["content"] for e in found)
+        # Writes through the view are compressed, and edits and deletes reach the index.
+        journal.db.execute("UPDATE events SET content=? WHERE id='e5'", ("replacement words " * 10,))
+        journal.db.execute("DELETE FROM events WHERE id='e6'")
+        journal.db.commit()
+        assert isinstance(journal.db.execute("SELECT content FROM events_data WHERE id='e5'").fetchone()[0], bytes)
+        if journal.fts:
+            assert [e["id"] for e in journal.search(tmp_path, "replacement")] == ["e5"]
+            assert all(e["id"] != "e6" for e in journal.search(tmp_path, "module_6.py", limit=500))
+    finally:
+        journal.close()
+    reopened = Journal(tmp_path / "j.db")  # A second open converts nothing again.
+    try:
+        assert reopened.db.execute("SELECT count(*) FROM events").fetchone()[0] == 1499
+    finally:
+        reopened.close()
+
+
+def test_compact_retrains_and_old_dictionaries_still_read(tmp_path):
+    from handoff_sessions import Journal, make_event
+    _plain_journal_with_history(tmp_path / "j.db", 1500)
+    journal = Journal(tmp_path / "j.db")
+    try:
+        first = journal.codec.latest["content"]
+        event = make_event("codex", "S", 99999, "assistant_message", "assistant", "A reply long enough to be compressed. " * 4, "2026-02-01", {})
+        newer = [make_event("claude", "T", n, "user_message", "user", f"Please rename variable_{n} and update docs/page_{n}.md " * 3,
+                            "2026-02-02", {"cwd": "/Users/me/project"}) for n in range(3000)]
+        journal.import_session({"id": "S", "source": "codex", "project": str(tmp_path), "path": "x", "updated": "2026-02-01", "events": [event]})
+        journal.import_session({"id": "T", "source": "claude", "project": str(tmp_path), "path": "y", "updated": "2026-02-02", "events": newer})
+        journal.train_compression()  # A newer dictionary; rows made with the first still read.
+        assert journal.codec.latest["content"] != first
+        assert journal.get([event["id"]])[0]["content"] == event["content"]
+        journal.compact()
+        assert journal.db.execute("SELECT count(*) FROM zstd_dicts").fetchone()[0] == 2  # Only the newest per kind.
+        assert journal.get([event["id"]])[0]["content"] == event["content"]
+        assert journal.db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     finally:
         journal.close()

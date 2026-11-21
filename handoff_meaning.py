@@ -87,6 +87,8 @@ class MeaningIndex:
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.db_path, timeout=10)
         db.execute("PRAGMA busy_timeout=10000")
+        from handoff_sessions import Codec
+        Codec(self.db_path, db).register(db)  # The events view reads compressed text.
         initialize(db)
         return db
 

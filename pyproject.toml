@@ -7,11 +7,12 @@ name = "handoff"
 version = "0.3.0"
 description = "Cross-harness coding-agent session handoff"
 requires-python = ">=3.9"
-dependencies = []
+# zstd compresses the journal and reads Codex's compressed history.
+dependencies = ["zstandard>=0.22"]
 
 [project.optional-dependencies]
-# Reads Codex's compressed history before Python 3.14, which includes zstd.
-zstd = ["zstandard>=0.22"]
+# Kept so existing "handoff[zstd]" installs still work.
+zstd = []
 # Search by meaning as well as words; downloads the 90 MB all-MiniLM-L6-v2 model once.
 meaning = ["fastembed>=0.4", "numpy>=1.24"]
 

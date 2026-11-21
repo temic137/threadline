@@ -284,6 +284,9 @@ Uninstalling MCP configuration does not delete the journal or original agent ses
   project/source/session/location is stored once in `capture_sources` and referred to by number. Larger records keep only their size and
   checksum. JSON formatting is not retained. Malformed JSON lines are archived as text.
   Unknown fields/types survive even when not normalized.
+- Message text, metadata and archived records are compressed with zstd, using dictionaries
+  trained on the journal's own rows (`zstd_dicts`). The `events` view reads them as text, and
+  writes to it are compressed. `handoff compact` retrains the dictionaries and recompresses.
 - `capture_snapshots` stores ordered record/checksum manifests so captured revisions
   can be reconstructed. Event-to-source links prevent rewriting one continuation
   file from deleting events captured from another.
