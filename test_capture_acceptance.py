@@ -274,3 +274,64 @@ def test_compact_shrinks_the_file_and_keeps_history(tmp_path):
         assert journal.db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     finally:
         journal.close()
+
+
+def test_review_requests_and_repeated_tool_output_are_slimmed_once(tmp_path):
+    from handoff_capture import initialize, slim_session
+    from handoff_sessions import Journal, make_event
+    journal = Journal(tmp_path / "j.db")
+    project = str(tmp_path)
+    try:
+        initialize(journal.db)
+        history = "The following is the Codex agent history whose request action you are assessing.\n" + "old turn " * 5000
+        action = '>>> APPROVAL REQUEST START\nPlanned action JSON:\n{"command": ["ls"]}\n>>> APPROVAL REQUEST END'
+        output = "file contents line\n" * 100
+        user_text = "please do it " * 100
+        events = [
+            make_event("codex", "R", 0, "user_message", "user", history + action, "2026-01-01T00:00:00Z", {}),
+            make_event("codex", "R", 1, "assistant_message", "assistant", '{"outcome":"allow"}', "2026-01-01T00:00:01Z", {}),
+            make_event("codex", "R", 2, "tool_result", "tool", output, "2026-01-01T00:00:02Z", {}),
+            make_event("codex", "R", 3, "tool_result", "tool", output, "2026-01-01T00:00:03Z", {}),
+            make_event("codex", "R", 4, "tool_result", "tool", "short", "2026-01-01T00:00:04Z", {}),
+            make_event("codex", "R", 5, "tool_result", "tool", "short", "2026-01-01T00:00:05Z", {}),
+            make_event("codex", "R", 6, "user_message", "user", user_text, "2026-01-01T00:00:06Z", {}),
+            make_event("codex", "R", 7, "user_message", "user", user_text, "2026-01-01T00:00:07Z", {}),
+        ]
+        journal.import_session({"id": "R", "source": "codex", "project": project, "path": "x", "updated": "2026-01-01", "events": events})
+        assert slim_session(journal.db, project, "codex", "R") == 2
+        assert slim_session(journal.db, project, "codex", "R") == 0
+        content = {row[0]: row[1] for row in journal.db.execute("SELECT ordinal, content FROM events")}
+        assert content[0].startswith("[Codex review request;") and content[0].endswith(action) and "old turn" not in content[0]
+        assert content[1] == '{"outcome":"allow"}'
+        assert content[2] == output
+        assert content[3] == f"[Same output as earlier tool result {events[2]['id']} in this chat; {len(output)} characters; sha256 " + content[3][-17:]
+        assert content[4] == content[5] == "short"
+        assert content[6] == content[7] == user_text  # People's messages are never changed.
+        assert {row[0] for row in journal.db.execute("SELECT id FROM events")} == {e["id"] for e in events}
+
+        # A later capture replaces the first copy: the repeat then points to the new one.
+        journal.db.execute("DELETE FROM events WHERE ordinal=2")
+        moved = make_event("codex", "R", 2, "tool_result", "tool", output, "2026-01-01T00:00:02Z", {"capture_order": 9})
+        journal.import_session({"id": "R", "source": "codex", "project": project, "path": "x", "updated": "2026-01-01", "events": [moved]})
+        assert slim_session(journal.db, project, "codex", "R") == 1
+        assert moved["id"] in journal.db.execute("SELECT content FROM events WHERE ordinal=3").fetchone()[0]
+        if journal.fts:
+            assert not journal.search(tmp_path, "turn")
+    finally:
+        journal.close()
+
+
+def test_old_journal_is_slimmed_on_first_open(tmp_path):
+    from handoff_capture import initialize
+    from handoff_sessions import Journal, make_event
+    journal = Journal(tmp_path / "j.db")
+    try:
+        output = "x" * 600
+        events = [make_event("cursor", "C", n, "tool_result", "tool", output, f"2026-01-01T00:00:0{n}Z", {}) for n in range(3)]
+        journal.import_session({"id": "C", "source": "cursor", "project": str(tmp_path), "path": "x", "updated": "2026-01-01", "events": events})
+        initialize(journal.db)
+        stored = [row[0] for row in journal.db.execute("SELECT content FROM events ORDER BY ordinal")]
+        assert stored[0] == output and all(s.startswith("[Same output as earlier tool result") for s in stored[1:])
+        assert journal.db.execute("SELECT value FROM journal_meta WHERE key='slim_version'").fetchone()[0] == "1"
+    finally:
+        journal.close()

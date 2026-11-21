@@ -236,6 +236,7 @@ def initialize(db):
             FROM capture_links l JOIN capture_sources s ON s.id=l.src;
     """)
     scrub_journal(db)
+    slim_journal(db)
 
 
 def migrate_archive(db):
@@ -438,6 +439,73 @@ TOOL_ARGUMENT_LIMIT = 2000
 TOOL_CONTENT_HEAD = 6000
 TOOL_CONTENT_TAIL = 2000
 MESSAGE_KINDS = ("user_message", "assistant_message")
+
+
+# Codex's approval reviewer gets the reviewed chat's history pasted in again. That history is
+# already captured in the reviewed chat, so a review keeps only the planned action and its verdict.
+REVIEW_PREFIX = "The following is the Codex agent history"
+REVIEW_ACTION = ">>> APPROVAL REQUEST START"
+# Agents often repeat a tool call with the same output; later copies point to the first one.
+REPEAT_KINDS = ("tool_result", "command")
+REPEAT_MIN_CHARS = 500
+REPEAT_NOTE = re.compile(r"\[Same output as earlier tool result (\w+) in this chat; (\d+) characters; sha256 (\w{16})\]")
+SLIM_VERSION = "1"
+
+
+def review_stub(content):
+    start = content.find(REVIEW_ACTION)
+    action = content[start:] if start >= 0 else content[-TOOL_CONTENT_TAIL:]
+    action = action[:TOOL_CONTENT_HEAD]
+    omitted = len(content) - len(action)
+    return f"[Codex review request; {omitted} characters of the reviewed chat's history not repeated here, see the reviewed chat]\n\n{action}"
+
+
+def slim_session(db, project, source, session_id):
+    """Shorten review requests and repeated tool output of one chat in place. Event ids stay the
+    same, so later captures recognize the rows. Running it again changes nothing. Returns rows changed."""
+    rows = db.execute("SELECT rowid, id, kind, content FROM events WHERE project=? AND source=? AND session_id=? "
+                      "ORDER BY timestamp, ordinal, rowid", (project, source, session_id)).fetchall()
+    first, changes = {}, []
+    for rowid, event_id, kind, content in rows:
+        if not content:
+            continue
+        new = None
+        if source == "codex" and kind == "user_message" and content.startswith(REVIEW_PREFIX):
+            new = review_stub(content)
+        elif kind in REPEAT_KINDS:
+            note = REPEAT_NOTE.fullmatch(content)
+            if note:
+                # The first copy may have been replaced by a later capture; point to the current one.
+                target, chars, digest = note.groups()
+                if first.get(digest, target) != target:
+                    new = f"[Same output as earlier tool result {first[digest]} in this chat; {chars} characters; sha256 {digest}]"
+            elif len(content) >= REPEAT_MIN_CHARS:
+                digest = hashlib.sha256(content.encode()).hexdigest()[:16]
+                if digest in first:
+                    new = f"[Same output as earlier tool result {first[digest]} in this chat; {len(content)} characters; sha256 {digest}]"
+                else:
+                    first[digest] = event_id
+        if new is not None and new != content:
+            changes.append((new, rowid, event_id))
+    if changes:
+        db.executemany("UPDATE events SET content=? WHERE rowid=?", [(new, rowid) for new, rowid, _ in changes])
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='meaning_done'").fetchone():
+            # Their meaning vectors described the old text; they are made again from the new text.
+            ids = [(event_id,) for _, _, event_id in changes]
+            db.executemany("DELETE FROM meaning_vectors WHERE event_id=?", ids)
+            db.executemany("DELETE FROM meaning_done WHERE event_id=?", ids)
+    return len(changes)
+
+
+def slim_journal(db):
+    """Apply slim_session to history captured before it existed, once."""
+    row = db.execute("SELECT value FROM journal_meta WHERE key='slim_version'").fetchone()
+    if row and row[0] == SLIM_VERSION:
+        return
+    with db:
+        for project, source, session_id in db.execute("SELECT DISTINCT project, source, session_id FROM events").fetchall():
+            slim_session(db, project, source, session_id)
+        db.execute("INSERT OR REPLACE INTO journal_meta VALUES ('slim_version',?)", (SLIM_VERSION,))
 
 
 def shortened_tool_content(content):
@@ -816,6 +884,7 @@ def synchronize(journal, project, home, source="auto", selected=None, reread=Fal
                         for event_id in old_ids - new_ids:
                             journal.db.execute("DELETE FROM events WHERE id=?", (event_id,))
                         journal.import_session(captured, commit=False)
+                        slim_session(journal.db, str(project), kind, sid)
                         # An event read before keeps its id, but may now belong in a different place.
                         journal.db.executemany("UPDATE events SET metadata=? WHERE id=?",
                                                [(json.dumps(e["metadata"], ensure_ascii=False), e["id"]) for e in captured["events"]])

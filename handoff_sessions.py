@@ -626,6 +626,10 @@ class Journal:
         from handoff_capture import initialize
         before = self.size()
         initialize(self.db)
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE name='meaning_done'").fetchone():
+            # Vectors of messages that no longer exist.
+            for table in ("meaning_vectors", "meaning_done"):
+                self.db.execute(f"DELETE FROM {table} WHERE event_id NOT IN (SELECT id FROM events)")
         self.db.commit()
         self.db.execute("VACUUM")
         self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
