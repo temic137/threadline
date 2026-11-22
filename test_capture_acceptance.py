@@ -399,7 +399,10 @@ def test_compact_retrains_and_old_dictionaries_still_read(tmp_path):
                             "2026-02-02", {"cwd": "/Users/me/project"}) for n in range(3000)]
         journal.import_session({"id": "S", "source": "codex", "project": str(tmp_path), "path": "x", "updated": "2026-02-01", "events": [event]})
         journal.import_session({"id": "T", "source": "claude", "project": str(tmp_path), "path": "y", "updated": "2026-02-02", "events": newer})
-        journal.train_compression()  # A newer dictionary; rows made with the first still read.
+        # A newer dictionary from different text (zstd names a dictionary after its contents, so the
+        # same text would give the same one); rows made with the first still read.
+        journal.codec.train(journal.db, {"content": [f"zebra {n} quantum {n * 7} lattice harbor {n % 11} " * 4 for n in range(1500)]})
+        journal.db.commit()
         assert journal.codec.latest["content"] != first
         assert journal.get([event["id"]])[0]["content"] == event["content"]
         journal.compact()

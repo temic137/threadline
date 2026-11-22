@@ -4,26 +4,33 @@ Local, cross-agent project handoff for Codex, Cursor, Claude Code, and Muse Code
 It imports matching local conversations, preserves redacted source records in SQLite,
 and gives the next agent a small evidence-linked working context through MCP.
 
-## Install once
+## Install
 
-```powershell
-python -m pip install -e "C:\path\to\handoff[zstd]"
-handoff setup
-handoff doctor
+macOS and Linux:
+
+```bash
+curl -LsSf https://raw.githubusercontent.com/temic137/handoff/main/install.sh | sh
 ```
 
-The `zstd` extra lets Handoff read the `.jsonl.zst` files Codex compresses older chats
-into. Python 3.14 can read them without it. If neither is available, Handoff reports the
-gap in its coverage report instead of quietly leaving those chats out.
+Windows (PowerShell):
 
-`setup` detects installed harnesses and registers `handoff --mcp` globally. Existing
-JSON/TOML configuration is backed up once with a `.handoff.bak` suffix. It preserves
-unrelated MCP servers and settings.
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/temic137/handoff/main/install.ps1 | iex"
+```
 
-An editable installation (`pip install -e ...`) uses changes in this source folder
-without reinstalling. Restart any coding agent/MCP connection that already has Handoff
-running so it loads the updated code, then run your usual transfer command again.
-A non-editable installation needs reinstalling after source updates.
+The installer gets [uv](https://docs.astral.sh/uv/) if it is missing, installs Handoff with
+search by meaning, and runs `handoff setup`, which registers Handoff with every coding agent it
+finds (Claude Code, Codex, Cursor, Muse Code). Existing agent settings are backed up once with a
+`.handoff.bak` suffix, and unrelated MCP servers are kept. Set `HANDOFF_LITE=1` for a smaller
+install with words-only search. Check everything with `handoff doctor`.
+
+If you already use uv: `uv tool install "handoff[meaning] @ git+https://github.com/temic137/handoff"`,
+then `handoff setup`.
+
+### Working on Handoff itself
+
+`python -m pip install -e ".[meaning]"` from a clone uses changes in the folder without
+reinstalling. Restart any agent that already has Handoff running so it loads the new code.
 
 ## Use
 

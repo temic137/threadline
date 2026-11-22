@@ -98,7 +98,10 @@ def configure(action: str, home: Path) -> int:
     else:
         results.append(("Claude Code", False, "not installed"))
 
-    cursor_installed = bool(shutil.which("cursor-agent") or (Path(os.environ.get("APPDATA", "")) / "Cursor").exists())
+    from handoff_sessions import cursor_root
+    # cursor_root is .../Cursor/User/workspaceStorage on Windows, macOS and Linux.
+    cursor_installed = bool(shutil.which("cursor-agent") or shutil.which("cursor") or (home / ".cursor").exists()
+                            or cursor_root(home).parent.parent.exists())
     if cursor_installed:
         ok, detail = update_json_server(home / ".cursor" / "mcp.json", entry if action == "setup" else None)
         results.append(("Cursor", ok, detail))

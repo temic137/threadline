@@ -10,6 +10,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 import zlib
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -602,7 +603,8 @@ class Codec:
 
     def load(self, db: sqlite3.Connection):
         try:
-            rows = db.execute("SELECT id, kind, data FROM zstd_dicts ORDER BY rowid").fetchall()
+            # The id is zstd's own (taken from the dictionary's contents), so order by training time.
+            rows = db.execute("SELECT id, kind, data FROM zstd_dicts ORDER BY trained IS NOT NULL, trained, rowid").fetchall()
         except sqlite3.OperationalError:
             rows = []
         self.dicts = {row[0]: zstandard.ZstdCompressionDict(row[2]) for row in rows}
@@ -652,8 +654,8 @@ class Codec:
                 trained_dict = zstandard.train_dictionary(DICTIONARY_BYTES, texts)
             except zstandard.ZstdError:
                 continue
-            db.execute("INSERT OR REPLACE INTO zstd_dicts(id, kind, data) VALUES (?,?,?)",
-                       (trained_dict.dict_id(), kind, trained_dict.as_bytes()))
+            db.execute("INSERT OR REPLACE INTO zstd_dicts(id, kind, data, trained) VALUES (?,?,?,?)",
+                       (trained_dict.dict_id(), kind, trained_dict.as_bytes(), time.time()))
             trained.append(kind)
         self.load(db)
         return trained
@@ -670,7 +672,9 @@ class Journal:
         self.db.execute("PRAGMA busy_timeout=5000")
         # After each checkpoint the write-ahead log is cut back, so it never stays at its largest size.
         self.db.execute("PRAGMA journal_size_limit=16777216")
-        self.db.execute("CREATE TABLE IF NOT EXISTS zstd_dicts (id INTEGER PRIMARY KEY, kind TEXT, data BLOB)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS zstd_dicts (id INTEGER PRIMARY KEY, kind TEXT, data BLOB, trained REAL)")
+        if "trained" not in [row[1] for row in self.db.execute("PRAGMA table_info(zstd_dicts)")]:
+            self.db.execute("ALTER TABLE zstd_dicts ADD COLUMN trained REAL")
         self.codec = Codec(path, self.db)
         self.codec.register(self.db)
         self._move_events_to_compressed_storage()
@@ -742,7 +746,8 @@ class Journal:
         samples = {}
         for column in ("content", "metadata"):
             samples[column] = [row[0] for row in self.db.execute(
-                f"SELECT handoff_inflate({column}) FROM {table} WHERE length({column}) >= ? "
+                # Compressed rows were long text when stored, however small they are now.
+                f"SELECT handoff_inflate({column}) FROM {table} WHERE typeof({column})='blob' OR length({column}) >= ? "
                 f"ORDER BY random() LIMIT ?", (PACK_MIN_CHARS, DICTIONARY_SAMPLES))]
         if self.db.execute("SELECT 1 FROM sqlite_master WHERE name='capture_archive'").fetchone():
             samples["archive"] = [row[0] for row in self.db.execute(
