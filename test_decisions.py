@@ -124,7 +124,7 @@ def test_setup_and_uninstall_all_adapters_in_isolation(tmp_path, monkeypatch):
     assert configure("uninstall", tmp_path) == 0
     assert any(c[:3] == ["codex", "mcp", "add"] for c in calls)
     assert any(c[:3] == ["claude", "mcp", "add"] for c in calls)
-    assert "handoff" not in json.loads((tmp_path / ".cursor/mcp.json").read_text())["mcpServers"]
+    assert "threadline" not in json.loads((tmp_path / ".cursor/mcp.json").read_text())["mcpServers"]
 
 
 def test_decision_mcp_real_process(tmp_path):

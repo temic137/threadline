@@ -1,21 +1,21 @@
 #!/bin/sh
-# Installs Handoff and registers it with the coding agents on this computer.
+# Installs Threadline and registers it with the coding agents on this computer.
 #   curl -LsSf <url of this file> | sh
 # Settings (optional environment variables):
-#   HANDOFF_SOURCE      where to install from (a package name, git URL or folder)
-#   HANDOFF_LITE=1      skip search by meaning (smaller install, words-only search)
-#   HANDOFF_NO_SETUP=1  install only; do not register with agents
+#   THREADLINE_SOURCE      where to install from (a package name, git URL or folder)
+#   THREADLINE_LITE=1      skip search by meaning (smaller install, words-only search)
+#   THREADLINE_NO_SETUP=1  install only; do not register with agents
 set -eu
 
-SOURCE="${HANDOFF_SOURCE:-git+https://github.com/temic137/handoff}"
-if [ "${HANDOFF_LITE:-0}" = "1" ]; then
-    PACKAGE="handoff @ $SOURCE"
+SOURCE="${THREADLINE_SOURCE:-git+https://github.com/temic137/handoff}"
+if [ "${THREADLINE_LITE:-0}" = "1" ]; then
+    PACKAGE="threadline @ $SOURCE"
 else
-    PACKAGE="handoff[meaning] @ $SOURCE"
+    PACKAGE="threadline[meaning] @ $SOURCE"
 fi
 case "$SOURCE" in
     git+*|http*|/*|.*) ;;
-    *) PACKAGE="$SOURCE"; [ "${HANDOFF_LITE:-0}" = "1" ] || PACKAGE="$SOURCE[meaning]" ;;
+    *) PACKAGE="$SOURCE"; [ "${THREADLINE_LITE:-0}" = "1" ] || PACKAGE="$SOURCE[meaning]" ;;
 esac
 
 if ! command -v uv >/dev/null 2>&1; then
@@ -24,15 +24,15 @@ if ! command -v uv >/dev/null 2>&1; then
     export PATH="$HOME/.local/bin:$PATH"
 fi
 
-echo "Installing Handoff..."
+echo "Installing Threadline..."
 uv tool install --force --python 3.13 "$PACKAGE"
 uv tool update-shell >/dev/null 2>&1 || true
-BIN="$(uv tool dir --bin)/handoff"
+BIN="$(uv tool dir --bin)/threadline"
 
-if [ "${HANDOFF_NO_SETUP:-0}" != "1" ]; then
+if [ "${THREADLINE_NO_SETUP:-0}" != "1" ]; then
     echo
     "$BIN" setup
 fi
 echo
 echo "Done. Open a project in any coding agent and ask: where did we stop?"
-echo "Open a new terminal to use the 'handoff' command."
+echo "Open a new terminal to use the 'threadline' command."

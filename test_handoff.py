@@ -392,10 +392,10 @@ def test_config_merge_and_journal_delete(tmp_path: Path):
     saved = json.loads(config.read_text())
     assert saved["setting"] is True
     assert saved["mcpServers"]["other"]["command"] == "other"
-    assert saved["mcpServers"]["handoff"]["command"] == "python"
+    assert saved["mcpServers"]["threadline"]["command"] == "python"
     assert config.with_name("mcp.json.handoff.bak").exists()
     assert update_json_server(config, None)[0]
-    assert "handoff" not in json.loads(config.read_text())["mcpServers"]
+    assert "threadline" not in json.loads(config.read_text())["mcpServers"]
 
     project, db = tmp_path / "project", tmp_path / "journal.db"
     project.mkdir()
@@ -419,8 +419,8 @@ def test_setup_and_uninstall_use_isolated_configs(tmp_path: Path, monkeypatch):
     assert configure("setup", tmp_path) == 0
     cursor = json.loads((tmp_path / ".cursor" / "mcp.json").read_text())
     muse = json.loads((tmp_path / ".config" / "muse" / "settings.json").read_text())
-    assert cursor["mcpServers"]["handoff"]["args"] == ["-m", "handoff", "--mcp"]
-    assert muse["mcpServers"]["handoff"]["required"] is False
+    assert cursor["mcpServers"]["threadline"]["args"] == ["-m", "handoff", "--mcp"]
+    assert muse["mcpServers"]["threadline"]["required"] is False
     assert configure("uninstall", tmp_path) == 0
-    assert "handoff" not in json.loads((tmp_path / ".cursor" / "mcp.json").read_text())["mcpServers"]
-    assert "handoff" not in json.loads((tmp_path / ".config" / "muse" / "settings.json").read_text())["mcpServers"]
+    assert "threadline" not in json.loads((tmp_path / ".cursor" / "mcp.json").read_text())["mcpServers"]
+    assert "threadline" not in json.loads((tmp_path / ".config" / "muse" / "settings.json").read_text())["mcpServers"]

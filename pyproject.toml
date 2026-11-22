@@ -1,11 +1,13 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "handoff"
-version = "0.3.0"
-description = "Cross-harness coding-agent session handoff"
+name = "threadline"
+version = "0.4.0"
+description = "Continue any project in any coding agent: Claude Code, Codex, Cursor and more, from one local history"
+license = "MIT"
+readme = "README.md"
 requires-python = ">=3.9"
 # zstd compresses the journal and reads Codex's compressed history.
 dependencies = ["zstandard>=0.22"]
@@ -17,7 +19,8 @@ zstd = []
 meaning = ["fastembed>=0.4", "numpy>=1.24"]
 
 [project.scripts]
-handoff = "handoff:main"
+threadline = "handoff:main"
+handoff = "handoff:main"  # The name before Threadline; kept so existing setups keep working.
 
 [tool.setuptools]
 py-modules = ["handoff", "handoff_sessions", "handoff_capture", "handoff_decisions", "handoff_typellm", "handoff_meaning"]

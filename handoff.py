@@ -41,6 +41,11 @@ def backup(path: Path):
         shutil.copy2(path, target)
 
 
+# The name agents list Threadline under. Entries saved under an older name are replaced.
+SERVER_NAME = "threadline"
+LEGACY_SERVER_NAMES = ("handoff",)
+
+
 def update_json_server(path: Path, entry: dict | None, defaults: dict | None = None) -> tuple[bool, str]:
     try:
         data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else dict(defaults or {})
@@ -52,12 +57,20 @@ def update_json_server(path: Path, entry: dict | None, defaults: dict | None = N
     if not isinstance(servers, dict):
         return False, "mcpServers is not an object"
     backup(path)
-    if entry is None:
-        servers.pop("handoff", None)
-    else:
-        servers["handoff"] = entry
+    for name in (SERVER_NAME, *LEGACY_SERVER_NAMES):
+        servers.pop(name, None)
+    if entry is not None:
+        servers[SERVER_NAME] = entry
     atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
     return True, str(path)
+
+
+def remove_quietly(command: list[str]):
+    """Remove an MCP entry that may not exist; failures do not matter."""
+    try:
+        subprocess.run(command, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def run_setup_command(command: list[str]) -> tuple[bool, str]:
@@ -78,10 +91,13 @@ def configure(action: str, home: Path) -> int:
     if codex:
         backup(home / ".codex" / "config.toml")
         if action == "setup":
-            subprocess.run([codex, "mcp", "remove", "handoff"], capture_output=True, text=True)
-            ok, detail = run_setup_command([codex, "mcp", "add", "handoff", "--", python, "-m", "handoff", "--mcp"])
+            for name in (SERVER_NAME, *LEGACY_SERVER_NAMES):
+                remove_quietly([codex, "mcp", "remove", name])
+            ok, detail = run_setup_command([codex, "mcp", "add", SERVER_NAME, "--", python, "-m", "handoff", "--mcp"])
         else:
-            ok, detail = run_setup_command([codex, "mcp", "remove", "handoff"])
+            for name in LEGACY_SERVER_NAMES:
+                remove_quietly([codex, "mcp", "remove", name])
+            ok, detail = run_setup_command([codex, "mcp", "remove", SERVER_NAME])
         results.append(("Codex", ok, detail))
     else:
         results.append(("Codex", False, "not installed"))
@@ -90,10 +106,13 @@ def configure(action: str, home: Path) -> int:
     if claude:
         backup(home / ".claude.json")
         if action == "setup":
-            subprocess.run([claude, "mcp", "remove", "--scope", "user", "handoff"], capture_output=True, text=True)
-            ok, detail = run_setup_command([claude, "mcp", "add", "--transport", "stdio", "--scope", "user", "handoff", "--", python, "-m", "handoff", "--mcp"])
+            for name in (SERVER_NAME, *LEGACY_SERVER_NAMES):
+                remove_quietly([claude, "mcp", "remove", "--scope", "user", name])
+            ok, detail = run_setup_command([claude, "mcp", "add", "--transport", "stdio", "--scope", "user", SERVER_NAME, "--", python, "-m", "handoff", "--mcp"])
         else:
-            ok, detail = run_setup_command([claude, "mcp", "remove", "--scope", "user", "handoff"])
+            for name in LEGACY_SERVER_NAMES:
+                remove_quietly([claude, "mcp", "remove", "--scope", "user", name])
+            ok, detail = run_setup_command([claude, "mcp", "remove", "--scope", "user", SERVER_NAME])
         results.append(("Claude Code", ok, detail))
     else:
         results.append(("Claude Code", False, "not installed"))
@@ -122,7 +141,7 @@ def configure(action: str, home: Path) -> int:
         state = "configured" if action == "setup" and ok else "removed" if ok else "skipped"
         print(f"{name:<12} {state:<10} {detail}")
     if action == "setup":
-        print("\nOpen the same project in another configured agent and type: Continue")
+        print("\nOpen the same project in another configured agent and ask: where did we stop?")
     return 0 if any(ok for _, ok, _ in results) else 1
 
 
@@ -147,8 +166,8 @@ def doctor(home: Path, db_path: Path) -> int:
             found += sum(path is not None for path in codex_databases(home))
         checks.append((source.title(), found > 0, f"{found} local session source(s)" if found else "not found"))
     for label, executable, command in (
-        ("Codex MCP", shutil.which("codex"), ["mcp", "get", "handoff"]),
-        ("Claude MCP", shutil.which("claude"), ["mcp", "get", "handoff"]),
+        ("Codex MCP", shutil.which("codex"), ["mcp", "get", SERVER_NAME]),
+        ("Claude MCP", shutil.which("claude"), ["mcp", "get", SERVER_NAME]),
     ):
         if executable:
             ok, detail = run_setup_command([executable, *command])
@@ -156,7 +175,7 @@ def doctor(home: Path, db_path: Path) -> int:
     for label, path in (("Cursor MCP", home / ".cursor" / "mcp.json"),
                         ("Muse MCP", home / ".config" / "muse" / "settings.json")):
         try:
-            configured = "handoff" in json.loads(path.read_text(encoding="utf-8")).get("mcpServers", {})
+            configured = SERVER_NAME in json.loads(path.read_text(encoding="utf-8")).get("mcpServers", {})
         except (OSError, json.JSONDecodeError, TypeError):
             configured = False
         checks.append((label, configured, "configured" if configured else "not configured"))
@@ -397,7 +416,9 @@ def configure_destination(destination, home, db_path):
     if not executable:
         return False, f"{destination} executable not found; use HANDOFF.md fallback."
     options = ["--transport", "stdio", "--scope", "user"] if destination == "claude" else []
-    return run_setup_command([executable, "mcp", "add", *options, "handoff", "--", sys.executable, *args])
+    for name in (SERVER_NAME, *LEGACY_SERVER_NAMES):
+        remove_quietly([executable, "mcp", "remove", *options[2:], name])
+    return run_setup_command([executable, "mcp", "add", *options, SERVER_NAME, "--", sys.executable, *args])
 
 
 def transfer_project(project, destination, home, db_path):
@@ -463,7 +484,7 @@ def main(argv: list[str] | None = None) -> int:
     home = Path(os.path.expanduser("~"))
     default_db = home / ".handoff" / "handoff.db"
     if not argv or argv[0] == "transfer":
-        command = argparse.ArgumentParser(prog="handoff transfer", description="Transfer all accessible project context to another coding agent.")
+        command = argparse.ArgumentParser(prog="threadline transfer", description="Transfer all accessible project context to another coding agent.")
         command.add_argument("--project", default=".")
         command.add_argument("--to", choices=("cursor", "claude", "codex", "muse"))
         command.add_argument("--db")
@@ -490,7 +511,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Transfer failed: {type(exc).__name__}. No destination loading has been verified.")
             return 1
     if argv and argv[0] == "compact":
-        command = argparse.ArgumentParser(prog="handoff compact", description="Shrink the journal file on disk. Close agent apps that use handoff first.")
+        command = argparse.ArgumentParser(prog="threadline compact", description="Shrink the journal file on disk. Close agent apps that use handoff first.")
         command.add_argument("--db")
         options = command.parse_args(argv[1:])
         path = Path(options.db).resolve() if options.db else default_db
@@ -509,7 +530,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if argv and argv[0] == "configure":
         from handoff_typellm import configure as configure_typellm
-        command = argparse.ArgumentParser(prog="handoff configure")
+        command = argparse.ArgumentParser(prog="threadline configure")
         command.add_argument("provider", choices=["typellm"])
         modes = command.add_mutually_exclusive_group()
         for mode in ("status", "check", "remove"):
@@ -522,7 +543,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
     if argv and argv[0] == "extract":
         from handoff_typellm import extract, extract_project
-        command = argparse.ArgumentParser(prog="handoff extract", description="Send selected redacted conversation exchanges to TypeLLM for decision extraction.")
+        command = argparse.ArgumentParser(prog="threadline extract", description="Send selected redacted conversation exchanges to TypeLLM for decision extraction.")
         command.add_argument("--project", default=".")
         command.add_argument("--db")
         command.add_argument("--source")
@@ -598,7 +619,7 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] == "index":
         from handoff_capture import synchronize
         from handoff_meaning import MeaningIndex, available
-        command = argparse.ArgumentParser(prog="handoff index", description="Build the meaning-search index, newest messages first. Safe to stop and rerun.")
+        command = argparse.ArgumentParser(prog="threadline index", description="Build the meaning-search index, newest messages first. Safe to stop and rerun.")
         command.add_argument("--project", default=".")
         command.add_argument("--db")
         options = command.parse_args(argv[1:])
@@ -651,12 +672,12 @@ def main(argv: list[str] | None = None) -> int:
         command.parse_args(argv[1:])
         return configure(argv[0], home)
     if argv and argv[0] == "doctor":
-        command = argparse.ArgumentParser(prog="handoff doctor")
+        command = argparse.ArgumentParser(prog="threadline doctor")
         command.add_argument("--db")
         options = command.parse_args(argv[1:])
         return doctor(home, Path(options.db).resolve() if options.db else default_db)
     if argv and argv[0] == "history":
-        command = argparse.ArgumentParser(prog="handoff history")
+        command = argparse.ArgumentParser(prog="threadline history")
         command.add_argument("--db")
         options = command.parse_args(argv[1:])
         journal = Journal(Path(options.db).resolve() if options.db else default_db)
@@ -667,7 +688,7 @@ def main(argv: list[str] | None = None) -> int:
             journal.close()
         return 0
     if argv and argv[0] == "delete":
-        command = argparse.ArgumentParser(prog="handoff delete")
+        command = argparse.ArgumentParser(prog="threadline delete")
         command.add_argument("--project", required=True)
         command.add_argument("--session")
         command.add_argument("--db")

@@ -199,7 +199,7 @@ def test_sqlite_transfer_and_real_destination_mcp(tmp_path):
     assert [c["id"] for c in index] == ["main"]
     assert "Please continue from the database history" in (project / ".handoff/events.jsonl").read_text()
     assert "item_json" in (project / ".handoff/capture_records.jsonl").read_text()
-    entry = json.loads((home / ".cursor/mcp.json").read_text())["mcpServers"]["handoff"]
+    entry = json.loads((home / ".cursor/mcp.json").read_text())["mcpServers"]["threadline"]
     request = {"id": 1, "method": "tools/call", "params": {"name": "resume", "arguments": {"project": str(project), "refresh": False}}}
     result = subprocess.run([entry["command"], *entry["args"]], input=json.dumps(request)+"\n",
                             capture_output=True, text=True, cwd=tmp_path, timeout=30)

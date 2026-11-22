@@ -1,6 +1,10 @@
-# handoff
+# Threadline
 
-Local, cross-agent project handoff for Codex, Cursor, Claude Code, and Muse Code.
+Continue any project in any coding agent. Threadline keeps one local, searchable history of
+your Codex, Cursor, Claude Code and Muse Code chats, so the next agent (or the next computer)
+can ask "where did we stop?" and get a short, evidence-linked answer. Formerly called Handoff;
+the `handoff` command still works.
+
 It imports matching local conversations, preserves redacted source records in SQLite,
 and gives the next agent a small evidence-linked working context through MCP.
 
@@ -18,19 +22,19 @@ Windows (PowerShell):
 powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/temic137/handoff/main/install.ps1 | iex"
 ```
 
-The installer gets [uv](https://docs.astral.sh/uv/) if it is missing, installs Handoff with
-search by meaning, and runs `handoff setup`, which registers Handoff with every coding agent it
+The installer gets [uv](https://docs.astral.sh/uv/) if it is missing, installs Threadline with
+search by meaning, and runs `threadline setup`, which registers Threadline with every coding agent it
 finds (Claude Code, Codex, Cursor, Muse Code). Existing agent settings are backed up once with a
-`.handoff.bak` suffix, and unrelated MCP servers are kept. Set `HANDOFF_LITE=1` for a smaller
-install with words-only search. Check everything with `handoff doctor`.
+`.handoff.bak` suffix, and unrelated MCP servers are kept. Set `THREADLINE_LITE=1` for a smaller
+install with words-only search. Check everything with `threadline doctor`.
 
-If you already use uv: `uv tool install "handoff[meaning] @ git+https://github.com/temic137/handoff"`,
-then `handoff setup`.
+If you already use uv: `uv tool install "threadline[meaning] @ git+https://github.com/temic137/handoff"`,
+then `threadline setup`.
 
-### Working on Handoff itself
+### Working on Threadline itself
 
 `python -m pip install -e ".[meaning]"` from a clone uses changes in the folder without
-reinstalling. Restart any agent that already has Handoff running so it loads the new code.
+reinstalling. Restart any agent that already has Threadline running so it loads the new code.
 
 ## Use
 
@@ -252,13 +256,13 @@ is read again from the start; this is not byte-offset incremental reading.
 For tools without MCP—or as a portable fallback—run this inside the project:
 
 ```powershell
-handoff
+threadline
 ```
 
 This writes one visible `HANDOFF.md`. Detailed files are opt-in:
 
 ```powershell
-handoff export
+threadline export
 ```
 
 That additionally writes `.handoff/transcript.md`, `.handoff/events.jsonl`, and
@@ -268,17 +272,17 @@ HANDOFF.md asks for selection when multiple conversations match; exports still i
 ## Commands
 
 ```text
-handoff setup                         Configure detected agents
-handoff doctor                        Check runtime, history, journal, FTS5 and MCP
-handoff uninstall                     Remove only handoff's MCP entries
-handoff                               Capture and write HANDOFF.md
-handoff export                        Also export Markdown and JSONL details
-handoff history                       List journaled projects
-handoff delete --project PATH --yes   Delete one project's journal history
-handoff compact                       Shrink the journal file (close agent apps first)
-handoff --check HANDOFF.md            Detect stale repository state
-handoff --source cursor               Force a source adapter
-handoff --session ID                  Force a session
+threadline setup                         Configure detected agents
+threadline doctor                        Check runtime, history, journal, FTS5 and MCP
+threadline uninstall                     Remove only Threadline's MCP entries
+threadline                               Capture and write HANDOFF.md
+threadline export                        Also export Markdown and JSONL details
+threadline history                       List journaled projects
+threadline delete --project PATH --yes   Delete one project's journal history
+threadline compact                       Shrink the journal file (close agent apps first)
+threadline --check HANDOFF.md            Detect stale repository state
+threadline --source cursor               Force a source adapter
+threadline --session ID                  Force a session
 ```
 
 Uninstalling MCP configuration does not delete the journal or original agent sessions.

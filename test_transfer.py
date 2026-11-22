@@ -40,7 +40,7 @@ def test_transfer_all_chats_archive_destination_and_real_mcp(tmp_path, monkeypat
     settings = json.loads(config.read_text())
     assert settings["mcpServers"]["unrelated"] == {"command": "keep"}
     assert config.with_name("mcp.json.handoff.bak").exists()
-    entry = settings["mcpServers"]["handoff"]
+    entry = settings["mcpServers"]["threadline"]
     request = {"id": 1, "method": "tools/call", "params": {"name": "resume",
                "arguments": {"project": str(project), "refresh": False}}}
     process = subprocess.run([entry["command"], *entry["args"]], input=json.dumps(request)+"\n",
@@ -115,7 +115,7 @@ def test_destination_setup_uses_exact_journal_and_runtime(tmp_path, monkeypatch,
     ok, _ = handoff.configure_destination(destination, tmp_path, db)
     assert ok
     if destination == "muse":
-        entry = json.loads((tmp_path / ".config/muse/settings.json").read_text())["mcpServers"]["handoff"]
+        entry = json.loads((tmp_path / ".config/muse/settings.json").read_text())["mcpServers"]["threadline"]
         command = [entry["command"], *entry["args"]]
     else:
         command = commands[0]
