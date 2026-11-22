@@ -47,14 +47,20 @@ def test_old_journal_is_cleaned_once_and_stays_usable(tmp_path):
     journal = Journal(tmp_path / "j.db")
     project = str(tmp_path)
     try:
-        initialize(journal.db)
+        # A journal from before capture_sources, holding secrets saved under older redaction rules.
+        journal.db.executescript("""
+            CREATE TABLE capture_records (project TEXT, source TEXT, session_id TEXT, location TEXT,
+                record_key TEXT, digest TEXT, payload TEXT, redacted INTEGER,
+                PRIMARY KEY(project, source, session_id, location, record_key, digest));
+            CREATE TABLE capture_reports (project TEXT PRIMARY KEY, report TEXT);
+            CREATE TABLE journal_meta (key TEXT PRIMARY KEY, value TEXT);
+            INSERT INTO journal_meta VALUES ('redaction_version', '1');
+        """)
         event = make_event("codex", "A", 0, "user_message", "user", f"here is {SLACK} and more", "2026-01-01T00:00:00Z", {"note": SLACK})
         journal.import_session({"id": "A", "source": "codex", "project": project, "path": str(tmp_path / "A"), "updated": "2026-01-01", "events": [event]})
         journal.db.execute("INSERT INTO capture_reports VALUES (?,?)", (project, json.dumps({"note": SLACK, "project": project})))
-        columns = [row[1] for row in journal.db.execute("PRAGMA table_info(capture_records)")]
-        journal.db.execute(f"INSERT INTO capture_records VALUES ({','.join('?' * len(columns))})",
-                           [SLACK if column == "payload" else column for column in columns])
-        journal.db.execute("UPDATE journal_meta SET value='1' WHERE key='redaction_version'")
+        journal.db.execute("INSERT INTO capture_records VALUES (?,?,?,?,?,?,?,?)",
+                           (project, "codex", "A", "loc", "key", "digest", SLACK, 0))
         journal.db.commit()
 
         initialize(journal.db)

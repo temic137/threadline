@@ -9,8 +9,12 @@ import json
 import os
 import re
 import sqlite3
+import threading
+import zlib
 from pathlib import Path
 from urllib.parse import unquote, urlparse
+
+import zstandard
 
 SECRET_PATTERNS = [
     (re.compile(r"(?i)(api[_-]?key\s*[:=]\s*)(['\"]?)[^\s'\"]+\2"), r"\1\2[REDACTED]\2"),
@@ -579,6 +583,82 @@ def discover(project: Path, home: Path, source: str = "auto", selected: str | No
     return read_cursor(path, known_project, cursor_id) if kind == "cursor" else READERS[kind](path)
 
 
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+PACK_MIN_CHARS = 64  # Shorter values stay plain text; compressing them saves nothing.
+PACK_KINDS = ("content", "metadata", "archive")
+DICTIONARY_BYTES = 112640
+DICTIONARY_SAMPLES = 20000
+DICTIONARY_MIN_SAMPLES = 1000
+
+
+class Codec:
+    """Compresses stored text with zstd. Each kind of value (message text, metadata, archived
+    records) gets a dictionary trained on this journal's own rows, so even short rows compress
+    well. Every compressed value names its dictionary, so values made with older ones still read."""
+
+    def __init__(self, path: Path, db: sqlite3.Connection):
+        self.path = path
+        self.load(db)
+
+    def load(self, db: sqlite3.Connection):
+        try:
+            rows = db.execute("SELECT id, kind, data FROM zstd_dicts ORDER BY rowid").fetchall()
+        except sqlite3.OperationalError:
+            rows = []
+        self.dicts = {row[0]: zstandard.ZstdCompressionDict(row[2]) for row in rows}
+        self.latest = {row[1]: row[0] for row in rows}
+        self.local = threading.local()  # zstd objects are not shared between threads.
+
+    def _cached(self, name, key, make):
+        cache = self.local.__dict__.setdefault(name, {})
+        if key not in cache:
+            cache[key] = make()
+        return cache[key]
+
+    def pack(self, text, kind):
+        if not isinstance(text, str) or len(text) < PACK_MIN_CHARS:
+            return text
+        key = self.latest.get(kind, 0)
+        compressor = self._cached("compress", key, lambda: zstandard.ZstdCompressor(
+            level=9, dict_data=self.dicts[key]) if key else zstandard.ZstdCompressor(level=9))
+        return compressor.compress(text.encode())
+
+    def unpack(self, value):
+        if not isinstance(value, bytes):
+            return value
+        if value[:4] != ZSTD_MAGIC:
+            return zlib.decompress(value).decode()  # Archive rows written before zstd.
+        key = zstandard.get_frame_parameters(value).dict_id
+        if key and key not in self.dicts:
+            # Another connection trained a dictionary since this one loaded them.
+            with sqlite3.connect(self.path) as other:
+                self.load(other)
+        decompressor = self._cached("decompress", key, lambda: zstandard.ZstdDecompressor(
+            dict_data=self.dicts[key]) if key else zstandard.ZstdDecompressor())
+        return decompressor.decompress(value).decode()
+
+    def register(self, db: sqlite3.Connection):
+        db.create_function("handoff_pack", 2, self.pack, deterministic=True)
+        db.create_function("handoff_inflate", 1, self.unpack, deterministic=True)
+
+    def train(self, db: sqlite3.Connection, samples: dict) -> list[str]:
+        """Train one dictionary per kind from sample texts; returns the kinds trained."""
+        trained = []
+        for kind, texts in samples.items():
+            texts = [t.encode() for t in texts if isinstance(t, str) and len(t) >= PACK_MIN_CHARS]
+            if len(texts) < DICTIONARY_MIN_SAMPLES:
+                continue
+            try:
+                trained_dict = zstandard.train_dictionary(DICTIONARY_BYTES, texts)
+            except zstandard.ZstdError:
+                continue
+            db.execute("INSERT OR REPLACE INTO zstd_dicts(id, kind, data) VALUES (?,?,?)",
+                       (trained_dict.dict_id(), kind, trained_dict.as_bytes()))
+            trained.append(kind)
+        self.load(db)
+        return trained
+
+
 class Journal:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -588,19 +668,47 @@ class Journal:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=5000")
+        # After each checkpoint the write-ahead log is cut back, so it never stays at its largest size.
+        self.db.execute("PRAGMA journal_size_limit=16777216")
+        self.db.execute("CREATE TABLE IF NOT EXISTS zstd_dicts (id INTEGER PRIMARY KEY, kind TEXT, data BLOB)")
+        self.codec = Codec(path, self.db)
+        self.codec.register(self.db)
+        self._move_events_to_compressed_storage()
+        # Messages are stored compressed in events_data. The events view reads them as text, and
+        # writes to the view are compressed by its triggers, so callers use events as a table.
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT, source TEXT, project TEXT, source_path TEXT, updated TEXT,
                 PRIMARY KEY (source, id)
             );
-            CREATE TABLE IF NOT EXISTS events (
+            CREATE TABLE IF NOT EXISTS events_data (
                 id TEXT PRIMARY KEY, session_id TEXT, source TEXT, project TEXT,
                 ordinal INTEGER, timestamp TEXT, kind TEXT, actor TEXT,
-                content TEXT, metadata TEXT
+                content BLOB, metadata BLOB
             );
-            CREATE INDEX IF NOT EXISTS events_project_order ON events(project, timestamp, ordinal);
+            CREATE INDEX IF NOT EXISTS events_project_order ON events_data(project, timestamp, ordinal);
             DROP INDEX IF EXISTS events_session;
-            CREATE INDEX IF NOT EXISTS events_session_kind ON events(project, source, session_id, kind, timestamp, ordinal);
+            CREATE INDEX IF NOT EXISTS events_session_kind ON events_data(project, source, session_id, kind, timestamp, ordinal);
+            CREATE VIEW IF NOT EXISTS events AS
+                SELECT id, session_id, source, project, ordinal, timestamp, kind, actor,
+                       handoff_inflate(content) AS content, handoff_inflate(metadata) AS metadata
+                FROM events_data;
+            CREATE TRIGGER IF NOT EXISTS events_view_insert INSTEAD OF INSERT ON events BEGIN
+                INSERT INTO events_data VALUES (new.id, new.session_id, new.source, new.project, new.ordinal,
+                    new.timestamp, new.kind, new.actor, handoff_pack(new.content, 'content'),
+                    handoff_pack(new.metadata, 'metadata'));
+            END;
+            CREATE TRIGGER IF NOT EXISTS events_view_update INSTEAD OF UPDATE ON events BEGIN
+                UPDATE events_data SET id=new.id, session_id=new.session_id, source=new.source,
+                    project=new.project, ordinal=new.ordinal, timestamp=new.timestamp, kind=new.kind,
+                    actor=new.actor,
+                    content=CASE WHEN new.content IS old.content THEN content ELSE handoff_pack(new.content, 'content') END,
+                    metadata=CASE WHEN new.metadata IS old.metadata THEN metadata ELSE handoff_pack(new.metadata, 'metadata') END
+                WHERE id=old.id;
+            END;
+            CREATE TRIGGER IF NOT EXISTS events_view_delete INSTEAD OF DELETE ON events BEGIN
+                DELETE FROM events_data WHERE id=old.id;
+            END;
         """)
         try:
             self._prepare_search_index()
@@ -612,6 +720,79 @@ class Journal:
 
     def close(self):
         self.db.close()
+
+    def _move_events_to_compressed_storage(self):
+        """Journals written before events_data keep messages as plain text in an events table.
+        Train dictionaries on them, then rename the table and compress every row, once."""
+        kind = self.db.execute("SELECT type FROM sqlite_master WHERE name='events'").fetchone()
+        if not kind or kind[0] != "table":
+            return
+        for trigger in ("events_fts_insert", "events_fts_delete", "events_fts_update",
+                        "chat_versions_insert", "chat_versions_delete", "chat_versions_update"):
+            self.db.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        self.db.execute("DROP TABLE IF EXISTS events_fts")  # Rebuilt from events_data afterwards.
+        self.db.commit()
+        self.train_compression(table="events")
+        with self.db:
+            self.db.execute("ALTER TABLE events RENAME TO events_data")
+            self.db.execute("UPDATE events_data SET content=handoff_pack(content, 'content'), "
+                            "metadata=handoff_pack(metadata, 'metadata')")
+
+    def compression_samples(self, table="events") -> dict:
+        samples = {}
+        for column in ("content", "metadata"):
+            samples[column] = [row[0] for row in self.db.execute(
+                f"SELECT handoff_inflate({column}) FROM {table} WHERE length({column}) >= ? "
+                f"ORDER BY random() LIMIT ?", (PACK_MIN_CHARS, DICTIONARY_SAMPLES))]
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE name='capture_archive'").fetchone():
+            samples["archive"] = [row[0] for row in self.db.execute(
+                "SELECT handoff_inflate(payload) FROM capture_archive ORDER BY random() LIMIT ?", (DICTIONARY_SAMPLES,))]
+        elif self.db.execute("SELECT 1 FROM sqlite_master WHERE name='capture_records' AND type='table'").fetchone():
+            samples["archive"] = [row[0] for row in self.db.execute(
+                "SELECT payload FROM capture_records ORDER BY random() LIMIT ?", (DICTIONARY_SAMPLES,))]
+        return samples
+
+    def train_compression(self, table="events") -> list[str]:
+        with self.db:
+            return self.codec.train(self.db, self.compression_samples(table))
+
+    def recompress(self):
+        """Compress every stored value with the newest dictionaries and drop the unused ones."""
+        with self.db:
+            self.db.execute("UPDATE events_data SET content=handoff_pack(handoff_inflate(content), 'content'), "
+                            "metadata=handoff_pack(handoff_inflate(metadata), 'metadata')")
+            if self.db.execute("SELECT 1 FROM sqlite_master WHERE name='capture_archive'").fetchone():
+                self.db.execute("UPDATE capture_archive SET payload=handoff_pack(handoff_inflate(payload), 'archive')")
+            keep = list(self.codec.latest.values())
+            self.db.execute(f"DELETE FROM zstd_dicts WHERE id NOT IN ({','.join('?' * len(keep))})", keep)
+        self.codec.load(self.db)
+
+    def maybe_train_compression(self, minimum=3000):
+        """New journals start without dictionaries; train them once there is enough history."""
+        if self.codec.latest:
+            return
+        if self.db.execute("SELECT count(*) FROM events_data").fetchone()[0] >= minimum and self.train_compression():
+            self.recompress()
+
+    def size(self) -> int:
+        return sum(p.stat().st_size for p in (self.path, Path(f"{self.path}-wal")) if p.exists())
+
+    def compact(self) -> tuple[int, int]:
+        """Move an old journal to the current layout and give free space back to the disk.
+        Returns the file size in bytes before and after."""
+        from handoff_capture import initialize
+        before = self.size()
+        initialize(self.db)
+        if self.train_compression():
+            self.recompress()
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE name='meaning_done'").fetchone():
+            # Vectors of messages that no longer exist.
+            for table in ("meaning_vectors", "meaning_done"):
+                self.db.execute(f"DELETE FROM {table} WHERE event_id NOT IN (SELECT id FROM events)")
+        self.db.commit()
+        self.db.execute("VACUUM")
+        self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return before, self.size()
 
     @property
     def meaning(self):
@@ -678,7 +859,7 @@ class Journal:
             if not self.fts:
                 raise sqlite3.OperationalError("FTS5 unavailable")
             rows = self.db.execute("""
-                SELECT e.* FROM events_fts f JOIN events e ON e.rowid=f.rowid
+                SELECT e.* FROM events_fts f JOIN events_data d ON d.rowid=f.rowid JOIN events e ON e.id=d.id
                 WHERE e.project=? AND events_fts MATCH ?
                 ORDER BY bm25(events_fts), e.timestamp DESC, e.ordinal DESC LIMIT ?
             """, (str(project.resolve()), match, limit)).fetchall()
@@ -986,7 +1167,7 @@ class Journal:
         try:
             if not self.fts:
                 raise sqlite3.OperationalError("FTS5 unavailable")
-            rows = self.db.execute(f"""SELECT {columns} FROM events_fts f JOIN events e ON e.rowid=f.rowid
+            rows = self.db.execute(f"""SELECT {columns} FROM events_fts f JOIN events_data d ON d.rowid=f.rowid JOIN events e ON e.id=d.id
                 WHERE e.project=? AND events_fts MATCH ? GROUP BY 1,2""", (key, match)).fetchall()
         except sqlite3.OperationalError:
             like = " OR ".join("e.content LIKE ?" for _ in terms)
@@ -1009,7 +1190,7 @@ class Journal:
         try:
             if not self.fts:
                 raise sqlite3.OperationalError("FTS5 unavailable")
-            row = self.db.execute(f"""SELECT e.* FROM events_fts f JOIN events e ON e.rowid=f.rowid
+            row = self.db.execute(f"""SELECT e.* FROM events_fts f JOIN events_data d ON d.rowid=f.rowid JOIN events e ON e.id=d.id
                 WHERE e.project=? AND e.source=? AND e.session_id=? AND events_fts MATCH ? ORDER BY {order} LIMIT 1""",
                                   (*key, match)).fetchone()
         except sqlite3.OperationalError:
@@ -1027,7 +1208,7 @@ class Journal:
             if not self.fts:
                 raise sqlite3.OperationalError("FTS5 unavailable")
             match = " OR ".join(f'"{term}"' for term in terms)
-            rows = self.db.execute(f"""SELECT e.*, bm25(events_fts) AS score FROM events_fts f JOIN events e ON e.rowid=f.rowid
+            rows = self.db.execute(f"""SELECT e.*, bm25(events_fts) AS score FROM events_fts f JOIN events_data d ON d.rowid=f.rowid JOIN events e ON e.id=d.id
                 WHERE events_fts MATCH ? AND e.project=? AND e.kind IN ({marks}) ORDER BY score LIMIT ?""",
                                    (match, key, *kinds, pool)).fetchall()
         except sqlite3.OperationalError:
@@ -1176,7 +1357,9 @@ class Journal:
         delete_vectors(self.db, project_value, session_id)
         ids = [row[0] for row in self.db.execute(f"SELECT id FROM events WHERE {clause}", params)]
         self.db.execute(f"DELETE FROM events WHERE {clause}", params)
-        for table in ("capture_records", "capture_state", "capture_event_links", "capture_snapshots", "decision_annotations"):
+        from handoff_capture import delete_sources
+        delete_sources(self.db, clause, params)
+        for table in ("capture_sources", "capture_state", "capture_snapshots", "decision_annotations"):
             self.db.execute(f"DELETE FROM {table} WHERE {clause}", params)
         self.db.execute("DELETE FROM capture_reports WHERE project=?", (project_value,))
         if session_id:
@@ -1201,51 +1384,46 @@ class Journal:
         return [dict(row) | {"metadata": json.loads(row["metadata"])} for row in rows]
 
     def _prepare_search_index(self):
-        """Index events without storing a second copy of them; triggers keep the index current."""
-        columns = [row[1] for row in self.db.execute("PRAGMA table_info(events_fts)")]
-        migrating = bool(columns) and columns != ["content"]
-        if migrating:
-            self.db.execute("DROP TABLE events_fts")
-        created = not columns or migrating
+        """Index message text without storing another copy of it (a contentless FTS5 table);
+        triggers on events_data keep the index current."""
+        row = self.db.execute("SELECT sql FROM sqlite_master WHERE name='events_fts'").fetchone()
+        if row and "contentless_delete" not in row[0]:
+            self.db.execute("DROP TABLE events_fts")  # An older index that read text from the events table.
+            row = None
         self.db.executescript("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(content, content='events', content_rowid='rowid');
-            CREATE TRIGGER IF NOT EXISTS events_fts_insert AFTER INSERT ON events BEGIN
-                INSERT INTO events_fts(rowid, content) VALUES (new.rowid, new.content);
+            CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5(content, content='', contentless_delete=1);
+            CREATE TRIGGER IF NOT EXISTS events_fts_insert AFTER INSERT ON events_data BEGIN
+                INSERT INTO events_fts(rowid, content) VALUES (new.rowid, handoff_inflate(new.content));
             END;
-            CREATE TRIGGER IF NOT EXISTS events_fts_delete AFTER DELETE ON events BEGIN
-                INSERT INTO events_fts(events_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
+            CREATE TRIGGER IF NOT EXISTS events_fts_delete AFTER DELETE ON events_data BEGIN
+                DELETE FROM events_fts WHERE rowid=old.rowid;
             END;
-            CREATE TRIGGER IF NOT EXISTS events_fts_update AFTER UPDATE OF content ON events BEGIN
-                INSERT INTO events_fts(events_fts, rowid, content) VALUES ('delete', old.rowid, old.content);
-                INSERT INTO events_fts(rowid, content) VALUES (new.rowid, new.content);
+            CREATE TRIGGER IF NOT EXISTS events_fts_update AFTER UPDATE OF content ON events_data
+            WHEN handoff_inflate(old.content) IS NOT handoff_inflate(new.content) BEGIN
+                DELETE FROM events_fts WHERE rowid=old.rowid;
+                INSERT INTO events_fts(rowid, content) VALUES (new.rowid, handoff_inflate(new.content));
             END;
             -- Counts changes to each chat, so search can keep a chat's outline until the chat changes.
             CREATE TABLE IF NOT EXISTS chat_versions (project TEXT, source TEXT, session_id TEXT, version INTEGER,
                                                       PRIMARY KEY (project, source, session_id));
-            CREATE TRIGGER IF NOT EXISTS chat_versions_insert AFTER INSERT ON events BEGIN
+            CREATE TRIGGER IF NOT EXISTS chat_versions_insert AFTER INSERT ON events_data BEGIN
                 INSERT INTO chat_versions VALUES (new.project, new.source, new.session_id, 1)
                     ON CONFLICT DO UPDATE SET version = version + 1;
             END;
-            CREATE TRIGGER IF NOT EXISTS chat_versions_delete AFTER DELETE ON events BEGIN
+            CREATE TRIGGER IF NOT EXISTS chat_versions_delete AFTER DELETE ON events_data BEGIN
                 INSERT INTO chat_versions VALUES (old.project, old.source, old.session_id, 1)
                     ON CONFLICT DO UPDATE SET version = version + 1;
             END;
-            CREATE TRIGGER IF NOT EXISTS chat_versions_update AFTER UPDATE ON events BEGIN
+            CREATE TRIGGER IF NOT EXISTS chat_versions_update AFTER UPDATE ON events_data BEGIN
                 INSERT INTO chat_versions VALUES (old.project, old.source, old.session_id, 1)
                     ON CONFLICT DO UPDATE SET version = version + 1;
                 INSERT INTO chat_versions VALUES (new.project, new.source, new.session_id, 1)
                     ON CONFLICT DO UPDATE SET version = version + 1;
             END;
         """)
-        if created:
+        if not row:
+            self.db.execute("INSERT INTO events_fts(rowid, content) SELECT rowid, handoff_inflate(content) FROM events_data")
             self.db.commit()
-            if migrating:
-                try:
-                    self.db.execute("VACUUM")  # Return the old index's space to the disk.
-                except sqlite3.OperationalError:
-                    pass  # Another process has the journal open; the space is reused instead.
-            # Rowids can change in VACUUM, so the index is built afterwards.
-            self.db.execute("INSERT INTO events_fts(events_fts) VALUES ('rebuild')")
 
 
 def event_importance(event: dict) -> int:

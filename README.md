@@ -268,6 +268,7 @@ handoff                               Capture and write HANDOFF.md
 handoff export                        Also export Markdown and JSONL details
 handoff history                       List journaled projects
 handoff delete --project PATH --yes   Delete one project's journal history
+handoff compact                       Shrink the journal file (close agent apps first)
 handoff --check HANDOFF.md            Detect stale repository state
 handoff --source cursor               Force a source adapter
 handoff --session ID                  Force a session
@@ -278,10 +279,14 @@ Uninstalling MCP configuration does not delete the journal or original agent ses
 ## Context quality
 
 - Redacted source payloads up to 2,000 characters and their revisions remain in
-  `capture_records` in `~/.handoff/handoff.db`, keyed by project, source, session,
-  location, record key, and payload checksum. Larger records keep only their size and
+  `~/.handoff/handoff.db`, compressed, and readable through the `capture_records` view,
+  keyed by project, source, session, location, record key, and payload checksum. Each
+  project/source/session/location is stored once in `capture_sources` and referred to by number. Larger records keep only their size and
   checksum. JSON formatting is not retained. Malformed JSON lines are archived as text.
   Unknown fields/types survive even when not normalized.
+- Message text, metadata and archived records are compressed with zstd, using dictionaries
+  trained on the journal's own rows (`zstd_dicts`). The `events` view reads them as text, and
+  writes to it are compressed. `handoff compact` retrains the dictionaries and recompresses.
 - `capture_snapshots` stores ordered record/checksum manifests so captured revisions
   can be reconstructed. Event-to-source links prevent rewriting one continuation
   file from deleting events captured from another.
