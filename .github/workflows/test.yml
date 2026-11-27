@@ -1,0 +1,66 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Check for real mistakes (unused names, undefined names, likely bugs)
+        run: uvx ruff check --select F,E9,B --exclude build .
+      - name: Run the tests
+        run: uv run --no-project --python ${{ matrix.python }} --with pytest --with zstandard --with "setuptools>=77" pytest -q -p no:cacheprovider
+
+  meaning:
+    name: tests with search by meaning (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Run the tests with fastembed and numpy installed
+        run: uv run --no-project --python 3.13 --with pytest --with zstandard --with "setuptools>=77" --with fastembed --with numpy pytest -q -p no:cacheprovider
+
+  install:
+    name: fresh install (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install with install.sh, as a new user would
+        if: runner.os != 'Windows'
+        env:
+          THREADLINE_SOURCE: ${{ github.workspace }}
+          THREADLINE_NO_SETUP: "1"
+        run: sh install.sh
+      - name: Install with install.ps1, as a new user would
+        if: runner.os == 'Windows'
+        env:
+          THREADLINE_SOURCE: ${{ github.workspace }}
+          THREADLINE_NO_SETUP: "1"
+        shell: powershell
+        run: powershell -ExecutionPolicy ByPass -File install.ps1
+      - name: Use it end to end
+        if: runner.os != 'Windows'
+        run: python3 ci/smoke.py "$HOME/.local/bin/threadline"
+      - name: Use it end to end
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: python ci/smoke.py "$env:USERPROFILE\.local\bin\threadline.exe"
