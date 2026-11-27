@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Threadline: every coding agent, one memory</title>
+  <meta name="description" content="Switch between Claude Code, Codex, Cursor and Gemini CLI without losing the thread. Your history stays on your computer.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M3 15c3-7 6-7 9-3s6 4 9-3' stroke='%23D85A30' stroke-width='2.6' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500;600&display=swap">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body class="landing">
+  <header class="wrap nav">
+    <a class="logo" href="/" aria-label="Threadline home">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 15c3-7 6-7 9-3s6 4 9-3" stroke="currentColor" stroke-width="2.4" fill="none" stroke-linecap="round"/></svg>
+      Threadline
+    </a>
+    <nav>
+      <a class="hide-small" href="#how">How it works</a>
+      <a class="hide-small" href="#privacy">Privacy</a>
+      <a href="https://github.com/temic137/threadline">GitHub</a>
+      <a class="button small" href="app">Try the demo</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="wrap hero">
+      <h1>Every coding agent.<br><em>One memory.</em></h1>
+      <p class="lede">Hit a limit in Claude Code, open Codex, and keep going. Threadline gives every agent the same memory of
+        your project: what you decided, what you ruled out, and where you stopped.</p>
+      <div class="actions">
+        <div class="command" data-command>
+          <span class="prompt">$</span>
+          <code data-mac="curl -LsSf https://threadline-409ee.web.app/install.sh | sh"
+                data-windows="irm https://threadline-409ee.web.app/install.ps1 | iex">curl -LsSf https://threadline-409ee.web.app/install.sh | sh</code>
+          <button type="button" aria-label="Copy the install command" data-copy>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+          </button>
+        </div>
+        <a class="button primary" href="app">Try the demo <span aria-hidden="true">→</span></a>
+      </div>
+      <p class="os"><span data-os-label>For macOS and Linux.</span> <button type="button" data-os-switch>On Windows?</button></p>
+
+      <figure class="thread-figure" aria-label="One thread running through Claude Code, Codex, Cursor and Gemini CLI">
+        <svg viewBox="0 0 920 210" role="img">
+          <path class="path" d="M0 105 C40 105 60 60 110 60 S300 150 350 150 S540 60 590 60 S780 150 830 150 S900 105 920 105"/>
+          <g class="node" style="animation-delay:0.6s"><rect x="35" y="38" width="150" height="44" rx="22"/><circle cx="59" cy="60" r="6" fill="#E39B4C"/><text x="77" y="65">Claude Code</text></g>
+          <g class="node" style="animation-delay:1.1s"><rect x="295" y="128" width="110" height="44" rx="22"/><circle cx="319" cy="150" r="6" fill="#5B9BD5"/><text x="337" y="155">Codex</text></g>
+          <g class="node" style="animation-delay:1.6s"><rect x="533" y="38" width="114" height="44" rx="22"/><circle cx="557" cy="60" r="6" fill="#A98BE8"/><text x="575" y="65">Cursor</text></g>
+          <g class="node" style="animation-delay:2.1s"><rect x="760" y="128" width="140" height="44" rx="22"/><circle cx="784" cy="150" r="6" fill="#4FB892"/><text x="802" y="155">Gemini CLI</text></g>
+        </svg>
+      </figure>
+    </section>
+
+    <section class="band" id="problem">
+      <div class="wrap">
+        <p class="eyebrow">The problem</p>
+        <h2>Every new chat starts from zero.</h2>
+        <p class="intro">You spend an hour deciding things with one agent. Then it hits a limit, or you switch tools, and the
+          next agent knows none of it. So you explain it all again, and something always gets lost.</p>
+        <div class="problem">
+          <div class="chat">
+            <header><strong>Claude Code</strong><span>2:14 pm</span></header>
+            <div class="line you">Go with Postgres for the queue. Skip Redis for now.</div>
+            <div class="line agent">Done. The queue runs on Postgres. test_partial_refund still fails: refunds match the wrong invoice.</div>
+            <p class="limit">Usage limit reached. Resets at 7 pm.</p>
+          </div>
+          <div class="chat">
+            <header><strong>Codex</strong><span>New chat, 2:16 pm</span></header>
+            <div class="line you">Where did we stop?</div>
+            <div class="line agent good">You moved the queue to Postgres and ruled out Redis. <mark>test_partial_refund still fails</mark>:
+              refunds are matched to the wrong invoice when two share an amount. Want me to start there?</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="band" id="how">
+      <div class="wrap">
+        <p class="eyebrow">How it works</p>
+        <h2>Install it once. Then forget it's there.</h2>
+        <p class="intro">No commands to remember and nothing to copy between tools. Threadline works in the background.</p>
+        <div class="steps">
+          <div class="step"><h3>Install once</h3><p>One command finds the coding agents on your computer and connects each of them. Nothing to configure.</p></div>
+          <div class="step"><h3>Keep working</h3><p>Every chat is saved to a journal on your computer as you go, in every agent, in every project.</p></div>
+          <div class="step"><h3>Switch freely</h3><p>Open any agent in the same project. It reads where you stopped before you type a word. Or ask it <code>where did we stop?</code></p></div>
+        </div>
+        <div class="agents" aria-label="Agents Threadline reads">
+          <span>Claude Code</span><span>Codex</span><span>Cursor</span><span>Gemini CLI</span><span>GitHub Copilot</span>
+          <span>Copilot CLI</span><span>Zed</span><span>Cline</span><span>Roo Code</span><span>Kilo Code</span><span>Kilo CLI</span>
+          <span>OpenCode</span><span>Muse Code</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="band" id="privacy">
+      <div class="wrap">
+        <p class="eyebrow">See your projects</p>
+        <h2>Gemini Nano reads your history on your own computer.</h2>
+        <p class="intro">Run <code>threadline open</code> for a page with every project: a short summary of where you stopped.
+          The page reads your history from your computer, and Gemini Nano runs
+          inside Chrome, so your chats stay with you.</p>
+        <div class="hybrid">
+          <div class="side first">
+            <h3><span class="pill device"><span class="dot"></span>On your computer</span></h3>
+            <p>Gemini Nano, built into Chrome. Used whenever your computer can run it.</p>
+            <ul>
+              <li><span>Your chats</span><span>Never leave your computer</span></li>
+              <li><span>Cost</span><span>Free</span></li>
+            </ul>
+          </div>
+          <div class="side">
+            <h3><span class="pill cloud"><span class="dot"></span>Google's cloud</span></h3>
+            <p>Gemini in the cloud through Firebase AI Logic, only when Nano can't run here.</p>
+            <ul>
+              <li><span>When</span><span>Nano unavailable or still downloading</span></li>
+              <li><span>Protected by</span><span>Firebase App Check</span></li>
+              <li><span>Account or API key</span><span>None needed</span></li>
+            </ul>
+          </div>
+        </div>
+        <p class="footnote">The page always shows which one answered.</p>
+      </div>
+    </section>
+
+    <section class="band" id="install">
+      <div class="wrap">
+        <p class="eyebrow">Install</p>
+        <h2>One command. About a minute.</h2>
+        <p class="intro">It installs Threadline, connects the agents it finds, and turns on pick-up at the start of each chat.
+          Restart your agents once afterwards.</p>
+        <div class="install">
+          <div class="box">
+            <h3>macOS and Linux</h3>
+            <div class="command" data-command><span class="prompt">$</span><code>curl -LsSf https://threadline-409ee.web.app/install.sh | sh</code>
+              <button type="button" aria-label="Copy the macOS and Linux command" data-copy><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></button></div>
+            <p>In Terminal.</p>
+          </div>
+          <div class="box">
+            <h3>Windows</h3>
+            <div class="command" data-command><span class="prompt">&gt;</span><code>irm https://threadline-409ee.web.app/install.ps1 | iex</code>
+              <button type="button" aria-label="Copy the Windows command" data-copy><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></button></div>
+            <p>In PowerShell.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="band" id="faq">
+      <div class="wrap"><div class="faq">
+        <p class="eyebrow">Questions</p>
+        <details><summary>Does my history leave my computer?</summary>
+          <p>No. The journal lives in a folder in your home directory. The page at threadline-409ee.web.app reads it straight
+            from your computer through a small local server that only answers that page, with a secret that changes every
+            time you run <code>threadline open</code>. The only exception is the cloud fallback: if Gemini Nano can't run,
+            the messages being read go to Gemini in Google's cloud, and the page says so.</p></details>
+        <details><summary>Do I need an account or an API key?</summary>
+          <p>No. There is nothing to sign up for and nothing to paste in.</p></details>
+        <details><summary>What does Gemini Nano need?</summary>
+          <p>Chrome on a recent computer with enough memory and free disk space. Chrome downloads the model once and the page
+            shows the progress. Until then, or if your computer can't run it, the page uses the cloud.</p></details>
+        <details><summary>Do my agents have to support Threadline?</summary>
+          <p>No. Threadline reads the chats each agent already saves on your computer and connects to each agent through MCP,
+            the standard way agents use tools.</p></details>
+        <details><summary>Is it free?</summary>
+          <p>Yes. Threadline is open source under the MIT license.</p></details>
+      </div></div>
+    </section>
+
+    <section class="closing">
+      <div class="wrap">
+        <h2>Pick up where you left off.</h2>
+        <div class="command" data-command><span class="prompt">$</span><code>curl -LsSf https://threadline-409ee.web.app/install.sh | sh</code>
+          <button type="button" aria-label="Copy the install command" data-copy><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></button></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site">
+    <div class="wrap">
+      <span>Threadline · MIT license · Built with Firebase AI Logic and Gemini Nano<br>Not affiliated with Anthropic, OpenAI, Anysphere or Google. Names and logos belong to their owners.</span>
+      <span><a href="app">Demo</a> · <a href="https://github.com/temic137/threadline">GitHub</a></span>
+    </div>
+  </footer>
+  <script src="landing.js"></script>
+</body>
+</html>

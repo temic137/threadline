@@ -1,0 +1,35 @@
+{
+  "hosting": {
+    "public": "handoff_web",
+    "cleanUrls": true,
+    "ignore": [
+      "**/*.py",
+      "**/__pycache__/**",
+      "**/.*"
+    ],
+    "headers": [
+      {
+        "source": "**",
+        "headers": [
+          {
+            "key": "X-Content-Type-Options",
+            "value": "nosniff"
+          },
+          {
+            "key": "Cache-Control",
+            "value": "no-cache"
+          }
+        ]
+      },
+      {
+        "source": "/install.@(sh|ps1)",
+        "headers": [
+          {
+            "key": "Content-Type",
+            "value": "text/plain; charset=utf-8"
+          }
+        ]
+      }
+    ]
+  }
+}

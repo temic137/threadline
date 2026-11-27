@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Threadline</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M3 15c3-7 6-7 9-3s6 4 9-3' stroke='%23D85A30' stroke-width='2.6' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500;600&display=swap">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <a class="logo" href="/" aria-label="Threadline home">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 15c3-7 6-7 9-3s6 4 9-3" stroke="currentColor" stroke-width="2.4" fill="none" stroke-linecap="round"/></svg>
+        Threadline
+      </a>
+      <input id="search" class="search" type="search" placeholder="Search" aria-label="Search what you discussed" autocomplete="off">
+      <div class="right"><span id="model" class="pill busy"><span class="dot"></span>Checking Gemini…</span></div>
+    </header>
+    <div id="notice" class="notice" hidden></div>
+    <div class="layout">
+      <aside class="projects" id="projects" aria-label="Projects"><div class="skeleton" style="width:70%"></div><div class="skeleton" style="width:55%"></div><div class="skeleton" style="width:62%"></div></aside>
+      <main class="reader" id="reader"><div><div class="skeleton" style="width:40%;height:40px"></div><div class="skeleton"></div><div class="skeleton" style="width:80%"></div></div></main>
+    </div>
+  </div>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
