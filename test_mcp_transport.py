@@ -38,8 +38,8 @@ def test_characters_outside_the_codepage_survive_the_transport(tmp_path):
 
 def test_non_ascii_arguments_arrive_as_utf8(tmp_path):
     _seed(tmp_path / "j.db", tmp_path, "café menu")
-    data = _serve(tmp_path / "j.db", tmp_path, "search", {"query": "café"})
-    assert data["events"][0]["content"] == "café menu"
+    data = _serve(tmp_path / "j.db", tmp_path, "search_context", {"query": "café"})
+    assert "café menu" in json.dumps(data["results"], ensure_ascii=False)
 
 
 def test_unexpected_tool_failure_keeps_the_server_alive(tmp_path, monkeypatch, capsys):

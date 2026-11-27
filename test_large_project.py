@@ -191,7 +191,6 @@ def test_an_earlier_record_under_the_old_folder_moves_to_the_current_project(tmp
 
 
 def test_a_chat_owned_by_a_project_codex_still_records_is_not_taken(tmp_path):
-    from handoff_sessions import make_event, session
     home, project, _ = moved_chat(tmp_path)
     other = tmp_path / "other"
     other.mkdir()
@@ -316,7 +315,7 @@ def test_one_chance_match_does_not_pull_a_later_file_among_the_database_messages
     home, project, folder = rollout_folder(tmp_path)
     january, february = "2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z"
     meta = {"type": "session_meta", "payload": {"id": MAIN, "cwd": str(project)}}
-    first = compressed_rollout(folder, f"rollout-2026-01-01T00-00-00-{MAIN}.jsonl.zst", [(january, row) for row in (
+    compressed_rollout(folder, f"rollout-2026-01-01T00-00-00-{MAIN}.jsonl.zst", [(january, row) for row in (
         meta, user("first request"), call("c1", "one"), output("c1", "a"), agent("first reply"),
         user("second request"), call("c2", "two"), output("c2", "b"), agent("second reply"))])
     # The later file repeats "first reply" on the same line as the database, by chance.

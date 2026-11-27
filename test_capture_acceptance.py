@@ -8,7 +8,6 @@ import shutil
 import zipfile
 from pathlib import Path
 
-import pytest
 
 from handoff_capture import synchronize
 from handoff_sessions import Journal
@@ -129,7 +128,7 @@ def test_mcp_real_process_with_isolated_home(tmp_path):
         {"id": 1, "method": "initialize"},
         {"method": "notifications/initialized"},
         {"id": 2, "method": "tools/list"},
-        {"id": 3, "method": "tools/call", "params": {"name": "capture", "arguments": {"project": str(project)}}},
+        {"id": 3, "method": "tools/call", "params": {"name": "resume", "arguments": {"project": str(project)}}},
         {"id": 4, "method": "tools/call", "params": {"name": "resume", "arguments": {"project": str(project), "refresh": False}}},
         {"id": 5, "method": "tools/call", "params": {"name": "resume", "arguments": {"project": str(project), "source": "codex", "session_id": "2", "refresh": False}}},
         {"id": 6, "method": "tools/call", "params": {"name": "search_context", "arguments": {"project": str(project), "query": "task-0"}}},
@@ -141,7 +140,7 @@ def test_mcp_real_process_with_isolated_home(tmp_path):
     assert process.returncode == 0, process.stderr
     replies = [json.loads(line) for line in process.stdout.splitlines()]
     assert [r["id"] for r in replies] == [1, 2, 3, 4, 5, 6, 7]
-    assert replies[2]["result"]["structuredContent"]["conversations_captured"] == 3
+    assert replies[2]["result"]["structuredContent"]["coverage"]["conversations_captured"] == 3
     assert replies[3]["result"]["structuredContent"]["status"] == "project_ready"
     assert len(replies[3]["result"]["structuredContent"]["conversations"]) == 3
     assert replies[4]["result"]["structuredContent"]["session_id"] == "2"
@@ -205,8 +204,10 @@ def test_wheel_contains_capture_module_and_runs_outside_checkout(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     repo = Path(__file__).parent
-    for name in ("pyproject.toml", "handoff.py", "handoff_sessions.py", "handoff_capture.py", "handoff_decisions.py", "handoff_typellm.py"):
+    for name in ("pyproject.toml", "README.md", "LICENSE", "handoff.py", "handoff_sessions.py", "handoff_capture.py",
+                 "handoff_decisions.py", "handoff_meaning.py", "handoff_agents.py"):
         shutil.copy2(repo / name, source / name)
+    shutil.copytree(repo / "handoff_web", source / "handoff_web", ignore=shutil.ignore_patterns("__pycache__"))
     built = subprocess.run([sys.executable, "-m", "pip", "wheel", str(source), "--no-deps", "--no-build-isolation",
                             "--wheel-dir", str(tmp_path / "wheels")], capture_output=True, text=True, timeout=60)
     assert built.returncode == 0, built.stdout + built.stderr
@@ -214,6 +215,8 @@ def test_wheel_contains_capture_module_and_runs_outside_checkout(tmp_path):
     installed = tmp_path / "installed"
     with zipfile.ZipFile(wheel) as archive:
         assert "handoff_capture.py" in archive.namelist()
+        assert {"handoff_web/index.html", "handoff_web/app.html", "handoff_web/test.html", "handoff_web/ai.js", "handoff_web/app.js",
+                "handoff_web/landing.js", "handoff_web/decision_test.json", "handoff_web/demo.json"} <= set(archive.namelist())
         archive.extractall(installed)
     env = {**os.environ, "PYTHONPATH": str(installed), "HOME": str(tmp_path), "USERPROFILE": str(tmp_path),
            "APPDATA": str(tmp_path / "appdata")}
@@ -411,3 +414,12 @@ def test_compact_retrains_and_old_dictionaries_still_read(tmp_path):
         assert journal.db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     finally:
         journal.close()
+
+
+def test_every_module_is_packaged():
+    """A module missing from py-modules installs fine but crashes on first use."""
+    import re
+    repo = Path(__file__).parent
+    listed = set(re.findall(r'"(handoff\w*)"', re.search(r"py-modules\s*=\s*\[(.*?)\]", (repo / "pyproject.toml").read_text(), re.S).group(1)))
+    present = {p.stem for p in repo.glob("handoff*.py")}
+    assert present <= listed, f"add to py-modules in pyproject.toml: {sorted(present - listed)}"

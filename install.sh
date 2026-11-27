@@ -7,7 +7,7 @@
 #   THREADLINE_NO_SETUP=1  install only; do not register with agents
 set -eu
 
-SOURCE="${THREADLINE_SOURCE:-git+https://github.com/temic137/handoff}"
+SOURCE="${THREADLINE_SOURCE:-git+https://github.com/temic137/threadline}"
 if [ "${THREADLINE_LITE:-0}" = "1" ]; then
     PACKAGE="threadline @ $SOURCE"
 else

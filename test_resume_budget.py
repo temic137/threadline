@@ -3,7 +3,6 @@ import json
 
 import pytest
 
-from handoff import transfer_project
 from handoff_capture import coverage_page, initialize, summarize_report
 from handoff_sessions import Journal, make_event, mcp_response
 
@@ -130,19 +129,6 @@ def test_mcp_search_context_leaves_out_neighbouring_tool_output_but_keeps_the_ma
     result = response["result"]["structuredContent"]["results"][0]
     contents = [e["content"] for exchange in result["exchanges"] for e in exchange["events"]]
     assert "needle in output" in contents and "z" * 500000 not in contents
-
-
-def test_transfer_exports_every_chat_even_when_the_overview_is_limited(journal, tmp_path):
-    project = tmp_path / "project"
-    project.mkdir()
-    for number in range(120):
-        add(journal, project, f"chat-{number:03}", [("user_message", f"work {number}")])
-    assert journal.project_context(project)["conversations_listed"] < 120
-    journal.db.commit()
-    (tmp_path / "home").mkdir()
-    transfer_project(project, "cursor", tmp_path / "home", tmp_path / "j.db")
-    assert len(json.loads((project / ".handoff" / "conversations.json").read_text(encoding="utf-8"))) == 120
-    assert len((project / ".handoff" / "events.jsonl").read_text(encoding="utf-8").splitlines()) == 120
 
 
 def test_coverage_summary_groups_gaps_and_pages_details():

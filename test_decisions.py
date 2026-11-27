@@ -1,5 +1,4 @@
 import json
-import os
 import subprocess
 import sys
 
@@ -50,6 +49,17 @@ def test_no_false_acceptance(tmp_path, text):
     try:
         seed(j, tmp_path, texts=[("user", text)])
         assert not track(j, tmp_path)["items"]
+    finally:
+        j.close()
+
+
+def test_asking_the_agent_to_use_a_tool_is_a_request_and_repeats_count_once(tmp_path):
+    j = Journal(tmp_path / "j.db")
+    try:
+        ask = "Use Handoff's resume tool on this folder and tell me where we left off."
+        seed(j, tmp_path, texts=[("user", ask), ("user", ask), ("user", "Use SQLite.")])
+        items = track(j, tmp_path)["items"]
+        assert [(i["kind"], i["text"]) for i in items] == [("request", ask), ("accepted_decision", "Use SQLite.")]
     finally:
         j.close()
 
@@ -131,28 +141,23 @@ def test_decision_mcp_real_process(tmp_path):
     db = tmp_path / "j.db"
     j = Journal(db)
     events = seed(j, tmp_path)
+    assert track(j, tmp_path)["items"]
+    assert annotate(j, tmp_path, "codex", "A", "goal", "Offline operation",
+                    [{"event_id": events[0]["id"], "quote": events[0]["content"]}])["status"] == "agent_interpretation"
     j.close()
     requests = [
-        {"id": 1, "method": "tools/call", "params": {"name": "decisions", "arguments": {"project": str(tmp_path)}}},
-        {"id": 2, "method": "tools/call", "params": {"name": "record_decision", "arguments": {
-            "project": str(tmp_path), "source": "codex", "session_id": "A", "kind": "goal", "text": "Offline operation",
-            "evidence": [{"event_id": events[0]["id"], "quote": events[0]["content"]}]}}},
         {"id": 3, "method": "tools/call", "params": {"name": "resume", "arguments": {"project": str(tmp_path), "refresh": False}}},
     ]
     result = subprocess.run([sys.executable, "-m", "handoff", "--mcp", "--db", str(db)],
                             input="\n".join(json.dumps(r) for r in requests) + "\n", text=True, capture_output=True, timeout=30)
     assert result.returncode == 0, result.stderr
     replies = [json.loads(line) for line in result.stdout.splitlines()]
-    assert replies[0]["result"]["structuredContent"]["items"]
-    assert replies[1]["result"]["structuredContent"]["status"] == "agent_interpretation"
-    assert replies[2]["result"]["structuredContent"]["decision_tracking"]["total_items"] == 7
+    assert replies[0]["result"]["structuredContent"]["decision_tracking"]["total_items"] == 7
 
 
 def test_mcp_bad_evidence_error_preserves_id_and_server_continues(tmp_path):
     requests = [
-        {"id": 91, "method": "tools/call", "params": {"name": "record_decision", "arguments": {
-            "project": str(tmp_path), "source": "codex", "session_id": "x", "kind": "goal", "text": "invented",
-            "evidence": [{"event_id": "missing", "quote": "fiction"}]}}},
+        {"id": 91, "method": "tools/call", "params": {"name": "read_conversation", "arguments": {"project": str(tmp_path)}}},
         {"id": 92, "method": "tools/list"},
         {"id": 93, "method": "prompts/list"},
         {"id": 94, "method": "prompts/get", "params": {"name": "handoff-resume", "arguments": {"project": str(tmp_path)}}},
@@ -162,7 +167,7 @@ def test_mcp_bad_evidence_error_preserves_id_and_server_continues(tmp_path):
     assert result.returncode == 0
     replies = [json.loads(line) for line in result.stdout.splitlines()]
     assert replies[0]["id"] == 91 and replies[0]["error"]["code"] == -32602
-    assert len(replies[1]["result"]["tools"]) == 10
+    assert {t["name"] for t in replies[1]["result"]["tools"]} == {"resume", "search_context", "read_conversation"}
     assert replies[2]["result"]["prompts"]
     assert replies[3]["result"]["messages"]
 

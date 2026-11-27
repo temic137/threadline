@@ -23,7 +23,9 @@ threadline = "handoff:main"
 handoff = "handoff:main"  # The name before Threadline; kept so existing setups keep working.
 
 [tool.setuptools]
-py-modules = ["handoff", "handoff_sessions", "handoff_capture", "handoff_decisions", "handoff_typellm", "handoff_meaning"]
+py-modules = ["handoff", "handoff_sessions", "handoff_capture", "handoff_decisions", "handoff_meaning", "handoff_agents"]
+packages = ["handoff_web"]
+package-data = { handoff_web = ["*.html", "*.js", "*.css", "*.json"] }
 
 [dependency-groups]
 dev = ["pytest>=8.0.0"]

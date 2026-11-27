@@ -87,48 +87,10 @@ unavailable coverage entry. Other checks cover malformed config preservation,
 empty-history reporting, CLI cancellation/validation paths, destination-only selection,
 all four setup paths, and a shared project-wide extraction budget with repeat caching.
 
-No actual destination UI was launched; Codex/Claude configuration commands and TypeLLM
-responses were mocked. No live conversations were sent to a provider or real user
+No actual destination UI was launched; Codex/Claude configuration commands were mocked. No live conversations were sent to a provider or real user
 destination settings changed. Destination consumption remains explicitly unverified.
 The implementation reuses the existing CLI, journal, and integrations without new
 dependencies. The older sections below document previous milestones.
-
-## Numbered selection and oversized extraction
-
-Regression run: `python -m pytest -q --tb=short` — **73 passed, 1 skipped**.
-The skipped test is the opt-in native credential test; no real credentials were
-read and no paid TypeLLM generation calls were made during this change.
-
-New tests cover numbered selection, invalid input, cancellation, remembered choices,
-switching, project isolation, deletion, child labels/main-first ordering, and the
-ID-free extraction CLI with refresh and caching. Slice tests reconstruct every
-character of long plain, escaped-control, Unicode, and assistant messages, enforce
-the serialized size bound, and reject evidence outside text actually sent.
-TypeLLM responses are mocked: live provider accuracy is not established by these tests.
-
-The implementation reuses the existing CLI and SQLite journal with no new dependency.
-Splitting preserves captured text but limits the context visible in each model call;
-it does not guarantee exhaustive or perfectly interpreted decisions.
-
-## TypeLLM secure setup and extraction
-
-Final regression result: **60 passed, 1 skipped** (the opt-in native credential test).
-That native test was run separately and passed.
-
-Tests exercise hidden input, refusal to fall back to echoed input, validation before
-saving, preserving the old key after failed validation, status/check/remove, HTTP
-authentication/credit/rate-limit/server failures, network errors, invalid JSON, and
-redirect refusal. Extraction tests exercise real annotation validation with mocked
-TypeLLM responses, indirect acceptance with preceding-message evidence, invalid quotes,
-repeat-run caching, call limits, redaction, and oversized-window reporting.
-
-The actual Windows Credential Manager round-trip test passed separately using a
-uniquely named dummy credential. It was read, replaced, and deleted; no existing user
-credentials were read or modified. This test is opt-in via HANDOFF_TEST_CREDENTIALS=1.
-
-No real TypeLLM API key was supplied, so authenticated provider validation/generation
-has not been run. Setup performs a real `/v1/models` check when the user enters a key.
-API request shapes were checked against https://typellm.ai/docs/api .
 
 ## Decision tracking and full-tool regression pass
 
@@ -326,6 +288,14 @@ apart from the left-out count:
 | First search | 11–13 s | 3.2 s |
 | Each further wording | 10–11 s | 2.2 s |
 | Slowest | 13–15 s | 6.8 s |
+
+### Ranking from memex's ideas — 2026-11-26
+
+Word matches no longer count words found in more than 0.5% of stored messages (at least 100),
+and the word and meaning lists are merged by reciprocal rank fusion instead of taking one result
+from each in turn. On the 27 tuning questions and 22 new ones (`benchmark/questions2.json`),
+Threadline's first chat was right 82 times in 98 searches, against 72 before and 71 for memex.
+Full tables are in `benchmark/RESULTS.md`.
 
 ## Limits of this verification
 

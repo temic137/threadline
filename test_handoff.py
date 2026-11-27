@@ -115,14 +115,14 @@ def test_capture_failure_does_not_block_other_chats(tmp_path, monkeypatch):
     try:
         captures, report = synchronize(journal, tmp_path, tmp_path, "codex")
         assert {c["id"] for c in captures} == {"good", "bad"}
-        assert any("Normalization failed" in gap for c in report["conversations"] for gap in c["gaps"])
+        # A line that is not a JSON object is skipped; the rest of the chat is still normalized.
+        assert not any("Normalization failed" in gap for c in report["conversations"] for gap in c["gaps"])
         assert report["new_records"] == 3
     finally:
         journal.close()
 
 
 def test_claude_child_identity_and_mcp_capture(tmp_path, monkeypatch):
-    from handoff_capture import synchronize
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     monkeypatch.setattr("handoff_sessions.cursor_root", lambda _: tmp_path / "cursor")
     base = tmp_path / ".claude" / "projects" / "project"
@@ -137,9 +137,8 @@ def test_claude_child_identity_and_mcp_capture(tmp_path, monkeypatch):
         summary = response["result"]["structuredContent"]["coverage"]
         assert summary["conversations_captured"] == 2 and "conversations" not in summary
         assert len(journal.search(tmp_path, "task")) == 2
-        reply = mcp_response({"id": 2, "method": "tools/call", "params": {
-            "name": "coverage", "arguments": {"project": str(tmp_path)}}}, journal)
-        report = reply["result"]["structuredContent"]
+        from handoff_capture import coverage_page, stored_report
+        report = coverage_page(stored_report(journal, tmp_path), 0, 20)
         assert {c["session_id"] for c in report["conversations"]} == {"parent", "parent/agent-one"}
         assert all("metadata" not in c for c in report["conversations"])
     finally:
@@ -375,8 +374,7 @@ def test_automatic_capture_journal_and_mcp(tmp_path: Path, monkeypatch, capsys):
         assert context["recent_exchanges"][0]["events"][0]["content"].startswith("finish the parser")
         assert context["recent_exchanges"][0]["events"][1]["content"] == "parser is half done"
         assert len(context["recent_exchanges"][0]["events"]) == 2
-        evidence_response = mcp_response({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "evidence", "arguments": {"ids": context["evidence_ids"]}}}, journal)
-        assert len(evidence_response["result"]["structuredContent"]["events"]) == 2
+        assert len(journal.get(context["evidence_ids"])) == 2
     finally:
         journal.close()
 
@@ -424,3 +422,22 @@ def test_setup_and_uninstall_use_isolated_configs(tmp_path: Path, monkeypatch):
     assert configure("uninstall", tmp_path) == 0
     assert "threadline" not in json.loads((tmp_path / ".cursor" / "mcp.json").read_text())["mcpServers"]
     assert "threadline" not in json.loads((tmp_path / ".config" / "muse" / "settings.json").read_text())["mcpServers"]
+
+
+def test_claude_records_that_copy_messages_are_not_read_as_messages(tmp_path):
+    from handoff_sessions import read_claude
+    path = tmp_path / "s1.jsonl"
+    rows = [
+        {"type": "user", "sessionId": "s1", "cwd": "/p", "timestamp": "2026-11-26T09:00:00Z",
+         "message": {"role": "user", "content": "Make the page responsive"}},
+        {"type": "assistant", "sessionId": "s1", "cwd": "/p", "timestamp": "2026-11-26T09:05:00Z",
+         "message": {"role": "assistant", "content": [{"type": "text", "text": "Done, and published."}]}},
+        # Claude Code keeps copies of what it sent the model, with no time of their own.
+        {"type": "api-request-blob", "sessionId": "s1", "hash": "x",
+         "message": {"role": "user", "content": "Make the page responsive"}},
+    ]
+    path.write_text("\n".join(json.dumps(r) for r in rows))
+    events = read_claude(path)["events"]
+    assert [(e["kind"], e["content"]) for e in events] == [("user_message", "Make the page responsive"),
+                                                          ("assistant_message", "Done, and published.")]
+    assert all(e["timestamp"] for e in events)

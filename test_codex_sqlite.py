@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from handoff_capture import synchronize
-from handoff_sessions import Journal, mcp_response
+from handoff_sessions import Journal
 from test_capture_acceptance import codex
 
 
@@ -186,20 +186,21 @@ def test_metadata_only_and_orphan_threads_have_visible_coverage(tmp_path):
         j.close()
 
 
-def test_sqlite_transfer_and_real_destination_mcp(tmp_path):
-    from handoff import transfer_project
+def test_sqlite_history_reaches_a_real_mcp_resume(tmp_path):
+    import handoff
     home, project = tmp_path / "home", tmp_path / "project"
     project.mkdir()
     _, history = databases(home, project)
     item(history, "main", 1, "userMessage", content=[{"type": "text", "text": "Please continue from the database history"}])
     item(history, "main", 2, "commandExecution", command="pytest", aggregatedOutput="Passed", exitCode=0)
     db = tmp_path / "handoff.db"
-    assert transfer_project(project, "cursor", home, db) == 0
-    index = json.loads((project / ".handoff/conversations.json").read_text())
-    assert [c["id"] for c in index] == ["main"]
-    assert "Please continue from the database history" in (project / ".handoff/events.jsonl").read_text()
-    assert "item_json" in (project / ".handoff/capture_records.jsonl").read_text()
-    entry = json.loads((home / ".cursor/mcp.json").read_text())["mcpServers"]["threadline"]
+    j = Journal(db)
+    try:
+        synchronize(j, project, home)
+        assert "item_json" in json.dumps([dict(r) for r in j.db.execute("SELECT * FROM capture_records")])
+    finally:
+        j.close()
+    entry = {"command": sys.executable, "args": [str(Path(handoff.__file__).resolve()), "--mcp", "--db", str(db)]}
     request = {"id": 1, "method": "tools/call", "params": {"name": "resume", "arguments": {"project": str(project), "refresh": False}}}
     result = subprocess.run([entry["command"], *entry["args"]], input=json.dumps(request)+"\n",
                             capture_output=True, text=True, cwd=tmp_path, timeout=30)

@@ -115,3 +115,31 @@ def test_a_chat_that_grows_between_searches_is_read_again(tmp_path):
                                          ("assistant_message", "pdfplumber parses the statements.", {"phase": "final_answer"})])
     found = journal.search_context(project, "parser statements", max_chars=24000)
     assert "pdfplumber" in shown(found) and found["results"][0]["total_exchanges"] == 2
+
+
+def test_words_in_most_messages_do_not_outrank_a_rare_one(tmp_path):
+    journal = Journal(tmp_path / "j.db")
+    project = tmp_path / "p"
+    project.mkdir()
+    items = [("user_message", "did the periculum id ever come back?"),
+             ("assistant_message", "No, the periculum id was never saved.", {"phase": "final_answer"})]
+    for n in range(120):     # "test" and "upload" are in nearly every message, so they say little
+        items += [("user_message", f"run the test and upload file {n}"),
+                  ("assistant_message", f"The test passed and file {n} was uploaded.", {"phase": "final_answer"})]
+    add(journal, project, "c1", items)
+    found = journal.search_context(project, "periculum test upload", max_chars=24000)
+    assert found["results"][0]["exchanges"][0]["index"] == 0
+
+
+def test_a_message_stored_twice_at_the_same_time_does_not_split_its_exchange(tmp_path):
+    journal = Journal(tmp_path / "j.db")
+    project = tmp_path / "p"
+    project.mkdir()
+    add(journal, project, "c1", [("user_message", "make the page responsive on phones"),
+                                 ("assistant_message", "Done and published.", {"phase": "final_answer"})])
+    copy = make_event("codex", "c1", 9, "user_message", "user", "make the page responsive on phones", "2026-03-01T10:00:00Z", {"capture_order": 9})
+    journal.import_session({"id": "c1", "source": "codex", "project": str(project), "path": str(project / "c1"),
+                            "updated": "2026-03-01", "events": [copy]})
+    groups = journal.exchanges(project, "codex", "c1", kinds=("user_message", "assistant_message"))
+    assert [[e["content"] for e in g] for g in groups] == [["make the page responsive on phones", "Done and published."]]
+    assert journal.order_problems() == {"copies": 1, "untimed": 0}

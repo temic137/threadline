@@ -2,6 +2,7 @@
 import hashlib
 import json
 import re
+from pathlib import Path
 
 
 RULES = (
@@ -11,6 +12,9 @@ RULES = (
     ("goal", r"^(?:(?:the |our |my )?goal\s*(?:is\b|:)|i want\b|we need\b|this must\b|it must\b)"),
     ("request", r"^(?:please\b|implement\b|build\b|fix\b|add\b|test\b|make sure\b|finish\b|can you\b)"),
 )
+
+# Asking the agent to do something now ("use the resume tool and tell me where we stopped") is a request, not a choice.
+ASKS_THE_AGENT = re.compile(r"(?i)\b(?:tell|show|give) me\b|\bwhere (?:we|i|you) (?:left off|stopped)\b|^use\b.{0,60}\b(?:tool|command)\b")
 
 
 def clauses(text):
@@ -40,7 +44,9 @@ def classify(quote):
         return None
     for kind, pattern in RULES:
         if re.search(pattern, plain, re.I):
-            return kind
+            if kind == "goal" and re.match(r"(?i)i want\b", plain) and len(plain.split()) < 4:
+                return None  # "I want yeah." says nothing lasting.
+            return "request" if kind == "accepted_decision" and ASKS_THE_AGENT.search(plain) else kind
     return None
 
 
@@ -51,11 +57,50 @@ def decision_id(source, session_id, kind, quote, event_id):
 def initialize(db):
     db.execute("""CREATE TABLE IF NOT EXISTS decision_annotations (
         id TEXT PRIMARY KEY, project TEXT, source TEXT, session_id TEXT, payload TEXT)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS handoff_notes (
+        project TEXT, place TEXT, text TEXT, method TEXT, through TEXT, written TEXT, PRIMARY KEY (project, place))""")
+
+
+NOTE_CHARS = 1500
+WRITERS = {"gemini_nano": "Gemini Nano on this computer", "gemini_cloud": "Gemini in Google's cloud"}
+
+
+def save_note(journal, project, place, text, method, through):
+    """Keep the page's "where you stopped" summary, so the next agent's resume starts from it."""
+    from datetime import datetime, timezone
+
+    from handoff_sessions import redact
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("The note is empty")
+    if method not in WRITERS:
+        raise ValueError("Unknown note writer")
+    initialize(journal.db)
+    clean = redact(re.sub(r"\[\[(.+?)\]\]", r"\1", text.strip()))[:NOTE_CHARS]
+    journal.db.execute("INSERT OR REPLACE INTO handoff_notes VALUES (?,?,?,?,?,?)",
+                       (str(Path(project).resolve()), place or "", clean, method, through or "", datetime.now(timezone.utc).isoformat()))
+    journal.db.commit()
+    return {"saved": True}
+
+
+def note_for(journal, project, newest_activity=""):
+    """The summary written for this project, or for the sub-project this folder is, with whether newer work came after it."""
+    initialize(journal.db)
+    key = str(Path(project).resolve())
+    rows = journal.db.execute("SELECT project, place, text, method, through, written FROM handoff_notes "
+                              "WHERE project=? OR (place != '' AND project || '/' || place = ?) ORDER BY written DESC", (key, key)).fetchall()
+    if not rows:
+        return None
+    exact = [r for r in rows if r[0] != key] or [r for r in rows if r[1] == ""] or rows
+    _, place, text, method, through, written = exact[0]
+    return {"text": text, "written_by": WRITERS.get(method, method), "written": written,
+            "about": place if place and place != "*several" else "whole project",
+            "current": not newest_activity or through >= newest_activity,
+            "note": "A model's summary of where the work stopped, written on the Threadline page. Check it against the exchanges."}
 
 
 def track(journal, project, source=None, session_id=None):
     initialize(journal.db)
-    items = []
+    items, seen = [], set()
     for conversation in journal.conversations(project):
         if source and conversation["source"] != source or session_id and conversation["id"] != session_id:
             continue
@@ -73,6 +118,9 @@ def track(journal, project, source=None, session_id=None):
                         kind = classify(quote)
                         if not kind or any(quote in reply for reply in agent_text):
                             continue  # Repeating the agent's wording is not the person's decision.
+                        if (src, sid, kind, quote) in seen:
+                            continue  # The same words sent twice in one chat are one decision.
+                        seen.add((src, sid, kind, quote))
                         item = {"id": decision_id(src, sid, kind, quote, event["id"]),
                                 "kind": kind, "text": quote, "source": src, "session_id": sid,
                                 "status": "completion_unknown" if kind == "request" else "explicit_user_wording",
@@ -101,7 +149,8 @@ def track(journal, project, source=None, session_id=None):
             "limitations": "Not exhaustive semantic extraction. Acceptance is explicit wording, not independent verification. Requests may already be completed. Corrections do not automatically supersede earlier decisions; branch and chat scopes remain separate."}
 
 
-def annotate(journal, project, source, session_id, kind, text, evidence, supersedes=None, conflicts_with=None):
+def annotate(journal, project, source, session_id, kind, text, evidence, supersedes=None, conflicts_with=None,
+             method="agent_annotation"):
     if kind not in {k for k, _ in RULES}:
         raise ValueError("Unknown decision kind")
     if not isinstance(text, str) or not text.strip() or len(text) > 4000:
@@ -128,7 +177,7 @@ def annotate(journal, project, source, session_id, kind, text, evidence, superse
                 raise ValueError("Cross-conversation decisions cannot be silently superseded; record a conflict instead")
     item = {"id": decision_id(source, session_id, kind, text, json.dumps(evidence, sort_keys=True)),
             "kind": kind, "text": text, "source": source, "session_id": session_id,
-            "status": "agent_interpretation", "method": "agent_annotation", "evidence": evidence,
+            "status": "agent_interpretation", "method": method, "evidence": evidence,
             "supersedes": supersedes or [], "conflicts_with": conflicts_with or []}
     from handoff_sessions import sanitize_value
     item = sanitize_value(item)

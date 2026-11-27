@@ -4,14 +4,17 @@ import hashlib
 import json
 import re
 import sqlite3
-import zlib
 from pathlib import Path
 from collections import Counter
 from contextlib import closing
 
+import zstandard
+
+from handoff_agents import cline_conversations, gemini_conversations, opencode_conversations, vscode_conversations
 from handoff_sessions import (
+    ALL_SOURCES,
     READERS, REDACTION_VERSION, candidate_meta, candidate_paths, make_event, read_cursor, read_jsonl, redact,
-    sanitize_session, sanitize_value, session, text_of,
+    sanitize_session, sanitize_value, session, text_of, zed_events, zed_folders, zed_thread_json,
 )
 
 
@@ -352,6 +355,10 @@ def record_types(kind, rows):
                 label = str(event.get("kind", "unknown"))
         elif kind == "cursor" and key == "header":
             label = "header"
+        elif kind in ("opencode", "kilo", "vscode", "gemini", "cline", "roo", "kilocode"):
+            label = key.split(":")[0]
+        elif kind == "zed":
+            label = "thread" if key == "thread" else next(iter(value), "unknown") if len(value) == 1 else str(value.get("role", "unknown"))
         counts[label] += 1
     supported = {
         "codex": {"session_meta", "event_msg/user_message", "event_msg/agent_message", "event_msg/item_completed",
@@ -362,6 +369,14 @@ def record_types(kind, rows):
         "muse": {"started", "assistant_message_committed", "assistant_tool_calls_committed",
                  "tool_result_batch_committed", "failed", "terminal"},
         "cursor": {"header", "1", "2"},
+        "zed": {"thread", "User", "Agent", "user", "assistant"},
+        "opencode": {"session", "message", "part", "v2"},
+        "kilo": {"session", "message", "part", "v2"},
+        "vscode": {"chat", "request"},
+        "gemini": {"metadata", "message"},
+        "cline": {"message"}, "roo": {"message"}, "kilocode": {"message"},
+        "copilot": {"session.start", "session.resume", "session.context_changed", "user.message", "assistant.message",
+                    "tool.execution_start", "tool.user_requested", "tool.execution_complete"},
     }[kind]
     return dict(counts), {key: count for key, count in counts.items() if key not in supported}
 
@@ -420,9 +435,68 @@ def cursor_conversations(path, project):
     ], {}
 
 
+def zed_conversations(path, project):
+    """Zed threads whose folders include this project, read from one consistent snapshot."""
+    # closing() releases the file at once, which matters on Windows while Zed is running.
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        db.execute("BEGIN")
+        columns = {row[1] for row in db.execute("PRAGMA table_info(threads)")}
+        if "folder_paths" not in columns:
+            return  # Zed versions before folder tracking do not say which project a thread belongs to.
+        listed = db.execute("SELECT id, parent_id, folder_paths, summary, updated_at, created_at FROM threads "
+                            "WHERE folder_paths IS NOT NULL").fetchall()
+        wanted = []
+        for thread_id, parent_id, folders, summary, updated, created in listed:
+            for folder in zed_folders(folders):
+                try:
+                    if workspace_path(folder) == project:
+                        wanted.append((thread_id, parent_id, folders, summary, updated, created))
+                        break
+                except (OSError, ValueError):
+                    continue
+        for thread_id, parent_id, folders, summary, updated, created in wanted:
+            if not isinstance(thread_id, str) or not thread_id:
+                continue
+            row = db.execute("SELECT data_type, data FROM threads WHERE id=?", (thread_id,)).fetchone()
+            gaps = ["Zed thread read from its database; attachment and image content are not copied."]
+            try:
+                thread = zed_thread_json(*row)
+            except (ValueError, TypeError, zstandard.ZstdError) as exc:
+                thread = {}
+                gaps.append(f"Thread data could not be read ({type(exc).__name__}); its title and folders are kept.")
+            timestamp = updated if isinstance(updated, str) else ""
+            events = zed_events(thread_id, thread, timestamp)
+            captured = session("zed", thread_id, str(project), path, events)
+            captured["updated"] = timestamp or captured["updated"]
+            metadata = {"title": summary if isinstance(summary, str) else "", "folders": zed_folders(folders),
+                        "created_at": created if isinstance(created, str) else ""}
+            if isinstance(parent_id, str) and parent_id:
+                metadata["parent_session_id"] = parent_id
+            messages = thread.get("messages") if isinstance(thread.get("messages"), list) else []
+            rows = [("thread", {"id": thread_id, "parent_id": parent_id, "folder_paths": folders, "summary": summary,
+                                "updated_at": updated, "created_at": created, "version": thread.get("version")})]
+            rows += [(str(index), message) for index, message in enumerate(messages)]
+            yield captured, rows, gaps, metadata
+
+
+# Agents that keep many chats in one store. Each reader takes (kind, path, project, the project the
+# store names if any, a test for "this folder is the project") and yields the chats of that project.
+MULTI_READERS = {
+    "zed": lambda kind, path, project, known, matches: zed_conversations(path, project),
+    "opencode": opencode_conversations,
+    "kilo": opencode_conversations,
+    "vscode": vscode_conversations,
+    "gemini": gemini_conversations,
+    "cline": cline_conversations,
+    "roo": cline_conversations,
+    "kilocode": cline_conversations,
+}
+
+
 # Source files stay on disk, so the journal keeps what resume and search need, not a second copy.
 # Raise this when the order of saved Codex events changes, so saved chats are read again.
 CODEX_ORDER_VERSION = "v2"
+CLAUDE_READER_VERSION = "c3"  # Raised when read_claude changes, so every Claude chat is read again.
 RAW_RECORD_LIMIT = 2000
 TOOL_ARGUMENT_LIMIT = 2000
 TOOL_CONTENT_HEAD = 6000
@@ -574,8 +648,8 @@ def compressed_capture(path):
     captured = READERS["codex"](path)
     metadata = {}
     for _, record in read_jsonl(path):
-        if isinstance(record, dict) and record.get("type") == "session_meta":
-            metadata.update(record.get("payload", {}))
+        if isinstance(record, dict) and record.get("type") == "session_meta" and isinstance(record.get("payload"), dict):
+            metadata.update(record["payload"])
         break
     return captured, [], ["Compressed rollout read directly: messages and tool activity normalized, raw records not copied. Attachment files are not copied."], metadata
 
@@ -584,7 +658,8 @@ def jsonl_capture(kind, path):
     rows, gaps, metadata = [], [], {}
     before = path.stat()
     # ponytail: reread histories to detect rewrites; byte cursors only if profiling justifies them.
-    with path.open(encoding="utf-8") as stream:
+    # Bytes that are not valid text become U+FFFD so one bad character cannot lose the whole chat.
+    with path.open(encoding="utf-8", errors="replace") as stream:
         for ordinal, line in enumerate(stream):
             try:
                 value = json.loads(line)
@@ -593,8 +668,8 @@ def jsonl_capture(kind, path):
                 value = line
             rows.append((str(ordinal), value))
             if isinstance(value, dict):
-                if value.get("type") == "session_meta":
-                    metadata.update(value.get("payload", {}))
+                if value.get("type") == "session_meta" and isinstance(value.get("payload"), dict):
+                    metadata.update(value["payload"])
                 for key in ("sessionId", "parentUuid", "isSidechain", "gitBranch", "cwd", "title"):
                     if key in value:
                         metadata[key] = value[key]
@@ -638,7 +713,7 @@ def synchronize(journal, project, home, source="auto", selected=None, reread=Fal
     projected, sqlite_threads, state_threads, sqlite_signatures = {}, set(), set(), {}
     skipped_unchanged = 0
     skipped_chats = set()
-    kinds = ("codex", "claude", "cursor", "muse") if source == "auto" else (source,)
+    kinds = ALL_SOURCES if source == "auto" else (source,)
     report["sources"] = {kind: {"candidate_files": sum(k == kind for k, _, _ in candidates)} for kind in kinds}
     if "codex" in report["sources"]:
         report["sources"]["codex"]["sqlite_databases"] = {"state": str(state_path) if state_path else None,
@@ -679,7 +754,7 @@ def synchronize(journal, project, home, source="auto", selected=None, reread=Fal
                 named = ROLLOUT_THREAD.match(path.name)
                 if (named and state_path and named.group(1) not in state_threads) or path.with_suffix("").exists():
                     continue
-            elif kind != "cursor" and not is_codex_db:
+            elif kind != "cursor" and kind not in MULTI_READERS and not is_codex_db:
                 with path.open(encoding="utf-8"):
                     pass
             if is_codex_db:
@@ -705,6 +780,34 @@ def synchronize(journal, project, home, source="auto", selected=None, reread=Fal
                         skipped_unchanged += 1
                     continue
                 entries = cursor_conversations(path, project)
+            elif kind in MULTI_READERS:
+                if known_project is not None and workspace_path(known_project) != project:
+                    continue  # A chat store that names another project.
+                location = str(path.resolve())
+                wal = path.with_name(path.name + "-wal")
+                # A chat in OpenCode's old file layout changes in other files, so it is always read.
+                multi_stamp = None if kind == "opencode" and path.suffix == ".json" else (
+                    f"{kind}-v1:{REDACTION_VERSION}:{file_stamp(path)}:{file_stamp(wal) if wal.exists() else ''}")
+                multi_key = f"{kind}_stamp:{project}:{location}"
+                known = journal.db.execute("SELECT value FROM journal_meta WHERE key=?", (multi_key,)).fetchone()
+                captured_before = journal.db.execute("SELECT session_id,details FROM capture_state WHERE project=? AND source=? AND location=?",
+                                                     (str(project), kind, location)).fetchall()
+                if not reread and not selected and multi_stamp and known and known[0] == multi_stamp:
+                    for session_id, stored in captured_before:
+                        details = json.loads(stored)
+                        if details.get("status") != "identity_conflict":
+                            details["status"] = "unchanged"
+                            skipped_chats.add((kind, session_id))
+                        report["conversations"].append(details)
+                        seen.add((str(project), kind, session_id, location))
+                        skipped_unchanged += 1
+                    continue
+                def same_project(folder):
+                    try:
+                        return workspace_path(folder) == project
+                    except (OSError, ValueError):
+                        return False
+                entries = list(MULTI_READERS[kind](kind, path, project, known_project, same_project))
             else:
                 sid, workspace = candidate_meta(kind, path, known_project)
                 if kind == "codex" and sid in thread_homes:
@@ -721,7 +824,7 @@ def synchronize(journal, project, home, source="auto", selected=None, reread=Fal
                     identity = (str(project), kind, selection_id, str(path.resolve()))
                     stat = path.stat()
                     boundary = projected.get((sid, workspace_path(path.with_suffix("") if compressed else path)))
-                    stamp = f"rollout-{CODEX_ORDER_VERSION}:{REDACTION_VERSION}:{stat.st_size}:{stat.st_mtime_ns}:{boundary[2] if boundary else sqlite_signatures.get(sid, ('',))[0]}"
+                    stamp = f"rollout-{CODEX_ORDER_VERSION}{CLAUDE_READER_VERSION if kind == 'claude' else ''}:{REDACTION_VERSION}:{stat.st_size}:{stat.st_mtime_ns}:{boundary[2] if boundary else sqlite_signatures.get(sid, ('',))[0]}"
                     row = journal.db.execute("SELECT details FROM capture_state WHERE project=? AND source=? AND session_id=? AND location=?", identity).fetchone()
                     if not reread and row and json.loads(row[0]).get("source_stamp") == stamp:
                         details = json.loads(row[0])
@@ -810,7 +913,7 @@ def synchronize(journal, project, home, source="auto", selected=None, reread=Fal
                     payload = json.dumps(clean, ensure_ascii=False, sort_keys=True, default=str)
                     clean_rows.append((str(key), payload, hashlib.sha256(payload.encode()).hexdigest(), value != clean))
                 serialized = json.dumps([[key, record_digest] for key, _, record_digest, _ in clean_rows])
-                policy = "codex-sqlite-v1:" if is_codex_db else (f"codex-overlap-v1:{cursor}:{overlap_digest}:" if projection is not None else "capture-v3:")
+                policy = "codex-sqlite-v1:" if is_codex_db else (f"codex-overlap-v1:{cursor}:{overlap_digest}:" if projection is not None else f"capture-v3{CLAUDE_READER_VERSION if kind == 'claude' else ''}:")
                 if compressed:
                     policy = stamp
                 digest = hashlib.sha256((policy + serialized).encode()).hexdigest()
@@ -904,6 +1007,8 @@ def synchronize(journal, project, home, source="auto", selected=None, reread=Fal
                         projected[(sid, workspace_path(metadata["rollout_path"]))] = metadata["projected_rollout_ordinal"], signatures, overlap_digest
             if kind == "cursor" and not selected and known_project and workspace_path(known_project) == project and path.suffix != ".jsonl":
                 journal.db.execute("INSERT OR REPLACE INTO journal_meta VALUES (?,?)", (cursor_key, cursor_stamp))
+            if kind in MULTI_READERS and not selected and multi_stamp:
+                journal.db.execute("INSERT OR REPLACE INTO journal_meta VALUES (?,?)", (multi_key, multi_stamp))
         except (OSError, ValueError, TypeError, AttributeError, KeyError, sqlite3.Error) as exc:
             report["gaps"].append({"source": kind, "path": str(path), "reason": f"Capture failed: {type(exc).__name__}: {exc}"})
     if codex_stamp and not codex_skip and not any(
@@ -916,7 +1021,7 @@ def synchronize(journal, project, home, source="auto", selected=None, reread=Fal
             details["status"] = "unavailable"
             details["gaps"] = ["Previously captured source was not available in this scan; archived history retained."]
             report["conversations"].append(details)
-    for kind, info in report["sources"].items():
+    for info in report["sources"].values():
         if not info["candidate_files"]:
             info["status"] = "No sources found in known local locations; installation/access not verified."
     report["source_files_captured"] = len(captured_sessions) + skipped_unchanged

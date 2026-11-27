@@ -6,7 +6,7 @@
 #   THREADLINE_NO_SETUP=1  install only; do not register with agents
 $ErrorActionPreference = "Stop"
 
-$source = if ($env:THREADLINE_SOURCE) { $env:THREADLINE_SOURCE } else { "git+https://github.com/temic137/handoff" }
+$source = if ($env:THREADLINE_SOURCE) { $env:THREADLINE_SOURCE } else { "git+https://github.com/temic137/threadline" }
 $extra = if ($env:THREADLINE_LITE -eq "1") { "" } else { "[meaning]" }
 if ($source -match '^(git\+|http|[A-Za-z]:\\|\\\\|\.|/)') {
     $package = "threadline$extra @ $source"
