@@ -694,6 +694,58 @@ def jsonl_capture(kind, path):
     return captured, rows, gaps, metadata
 
 
+def discover_projects(home):
+    """Every existing folder that saved chats name, with how many chats name it. Used to import a whole
+    history at once on first run; later, agents keep each project current as they ask."""
+    home = Path(home)
+    found = Counter()
+    state_path, _ = codex_databases(home)
+    try:
+        thread_homes = codex_thread_homes(state_path)
+    except sqlite3.Error:
+        thread_homes = {}
+    for kind, path, known_project in candidate_paths(home):
+        try:
+            if kind == "zed":
+                with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+                    columns = {row[1] for row in db.execute("PRAGMA table_info(threads)")}
+                    if "folder_paths" in columns:
+                        for (folders,) in db.execute("SELECT folder_paths FROM threads WHERE folder_paths IS NOT NULL"):
+                            for folder in zed_folders(folders):
+                                found[workspace_path(folder)] += 1
+                continue
+            if known_project is not None:
+                found[workspace_path(known_project)] += 1
+                continue
+            if kind in MULTI_READERS:
+                continue
+            session_id, workspace = candidate_meta(kind, path)
+            workspace = thread_homes.get(session_id, workspace) if kind == "codex" else workspace
+            if workspace:
+                found[workspace_path(workspace)] += 1
+        except (OSError, ValueError, sqlite3.Error):
+            continue
+    own = home.resolve()
+    return {folder: count for folder, count in found.items()
+            if isinstance(folder, Path) and folder != own and folder.is_dir()}
+
+
+def import_everything(journal, home, progress=None):
+    """Save the chats of every project found on this computer. Returns how many projects were read."""
+    projects = sorted(discover_projects(home), key=str)
+    for number, project in enumerate(projects, 1):
+        try:
+            synchronize(journal, project, home)
+        except Exception:  # One unreadable project must not stop the rest.
+            pass
+        if progress:
+            progress(number, len(projects), project)
+    journal.db.execute("INSERT OR REPLACE INTO journal_meta (key, value) VALUES ('imported_all', ?)",
+                       (datetime.datetime.now(datetime.timezone.utc).isoformat(),))
+    journal.db.commit()
+    return len(projects)
+
+
 def synchronize(journal, project, home, source="auto", selected=None, reread=False):
     """Archive all exact-workspace matches, preserving revisions and explicit gaps.
     Unchanged sources are skipped and not returned; reread=True returns every chat for exports."""

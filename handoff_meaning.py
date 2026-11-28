@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 import sqlite3
 import threading
 import time
@@ -37,6 +38,12 @@ def passages(content: str) -> list[tuple[int, str]]:
         return []
     starts = range(0, max(len(content) - 200, 1), STEP)
     return [(start, content[start:start + PASSAGE]) for start in list(starts)[:MAX_PASSAGES]]
+
+
+# The model download is one quiet line in setup, not Hugging Face's progress bars and token warnings.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+warnings.filterwarnings("ignore", message="Cannot enable progress bars")
 
 
 class FastEmbedder:

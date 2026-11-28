@@ -963,6 +963,26 @@ Less common:
   threadline compact          shrink the history file"""
 
 
+def import_history(home: Path, db_path: Path):
+    """On first run, save the chats already on this computer, so the page and agents start with them."""
+    from handoff_capture import import_everything
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    journal = Journal(db_path)
+    try:
+        try:
+            if journal.db.execute("SELECT 1 FROM journal_meta WHERE key='imported_all'").fetchone():
+                return
+        except sqlite3.OperationalError:
+            pass
+        print("\nReading the chats already on this computer...", flush=True)
+        projects = import_everything(journal, home, lambda done, total, _: print(
+            f"\r  {done} of {total} projects", end="", flush=True))
+        chats = journal.db.execute("SELECT count(*) FROM sessions").fetchone()[0]
+        print(f"\r  Saved {chats} chats from {projects} projects." + " " * 10, flush=True)
+    finally:
+        journal.close()
+
+
 def prepare_meaning(db_path: Path):
     """Download the search-by-meaning model during setup, so the first search is not slow."""
     import handoff_meaning
@@ -1009,6 +1029,7 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--db")
         options = command.parse_args(argv[1:])
         from handoff_web import open_page
+        import_history(home, Path(options.db).resolve() if options.db else default_db)
         return open_page(home, Path(options.db).resolve() if options.db else default_db, options.port, not options.no_browser,
                          options.local_page)
     if argv and argv[0] == "compact":
@@ -1127,6 +1148,7 @@ def main(argv: list[str] | None = None) -> int:
         command.parse_args(argv[1:])
         result = configure(argv[0], home)
         if argv[0] == "setup":
+            import_history(home, default_db)
             prepare_meaning(default_db)
         return result
     if argv and argv[0] == "doctor":
