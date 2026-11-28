@@ -27,5 +27,3 @@ py-modules = ["handoff", "handoff_sessions", "handoff_capture", "handoff_decisio
 packages = ["handoff_web"]
 package-data = { handoff_web = ["*.html", "*.js", "*.css", "*.json"] }
 
-[dependency-groups]
-dev = ["pytest>=8.0.0"]

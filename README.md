@@ -109,7 +109,6 @@ guarantee that every credential format is recognized. Agents change their storag
 
 ```bash
 python -m pip install -e ".[meaning]"
-python -m pytest -q
 ```
 
 Python 3.9+. MIT license.
