@@ -122,7 +122,7 @@ def main():
     questions_file = os.environ.get("QUESTIONS", "questions.json")
     questions = json.load(open(HERE / questions_file))
     names = sys.argv[1:] or list(TOOLS)
-    results_file = HERE / ("results.json" if questions_file == "questions.json" else "results2.json")
+    results_file = HERE / os.environ.get("RESULTS", "results.json" if questions_file == "questions.json" else "results2.json")
     results = json.load(open(results_file)) if results_file.exists() else {}
     for name in names:
         results[name] = {}
@@ -137,14 +137,16 @@ def main():
                 ranks = [ids.index(s) + 1 for s in question.get("sessions", [question["session"]]) if s in ids]
                 rank = min(ranks) if ranks else None
                 rows.append({"n": question["n"], "rank": rank, "answer_shown": question["needle"] in out[:LIMIT],
+                             "chars": len(out),
                              "seconds": round(time.monotonic() - began, 2)})
             results[name][style] = rows
             first = sum(r["rank"] == 1 for r in rows)
             top5 = sum(bool(r["rank"]) and r["rank"] <= 5 for r in rows)
             shown = sum(r["answer_shown"] for r in rows)
             seconds = sorted(r["seconds"] for r in rows)[len(rows) // 2]
+            chars = sorted(min(r["chars"], LIMIT) for r in rows)[len(rows) // 2]
             print(f"{name:<11} {style:<9} first {first:>2}/{len(rows)}  top5 {top5:>2}/{len(rows)}  "
-                  f"answer shown {shown:>2}/{len(rows)}  median {seconds:.2f}s", flush=True)
+                  f"answer shown {shown:>2}/{len(rows)}  median {seconds:.2f}s  median {chars} chars", flush=True)
     json.dump(results, open(results_file, "w"), indent=1)
 
 

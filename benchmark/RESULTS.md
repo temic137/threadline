@@ -23,6 +23,49 @@ ccrider has only word search.
   as for memex. Its natural-language searches mostly return nothing (word search needs every word).
 - Threadline's set-2 scores are 1–2 lower than on 2026-11-26 (journal changed since: duplicate copies removed).
 
+## Efficiency (2026-11-28): same history in, what each tool costs
+
+### Footprint: every tool given the same 165 MB of chats
+
+One project's history (Threadline's own: 27 Claude Code chats and 21 Codex chats, 165 MB of raw
+`.jsonl`) was copied into an empty home folder, and each tool built its index there from nothing.
+Codex files were decompressed and their folder set to the Mac path, so every tool could read all of
+them. Meaning search used the same small model (all-MiniLM-L6-v2) where a tool allows a choice.
+
+| Tool | Index on disk | Index vs. raw chats | Build time | Peak memory | Model | Program |
+|---|---|---|---|---|---|---|
+| Threadline | 39 MB | 24% | 55 s | 0.9 GB | 87 MB | 171 MB (Python packages) |
+| memex | 45 MB | 27% | 39 s | 1.5 GB | 87 MB | 40 MB |
+| cass | 300 MB | 182% | 2 min 41 s | 1.4 GB | 87 MB | 70 MB |
+| recall-cli | 21 MB | 13% | 7 min 36 s | 1.3 GB (in Ollama) | 639 MB | 10 MB, plus Ollama |
+| ccrider | 15 MB | 9% | 2 s | 85 MB | none (words only) | 23 MB |
+
+- Threadline gives every one of its 1,439 messages a meaning vector; memex gave vectors to 1,775 of its
+  11,102 records. cass keeps a full copy of the raw chats (154 MB) next to its index. ccrider stores
+  messages without tool output (2,129 messages), which is why it is smallest and fastest to build.
+- Threadline's program size includes the meaning model's runtime (onnxruntime); `THREADLINE_LITE=1`
+  installs without it.
+
+### Tokens: what each search costs the agent
+
+The 98 searches above, rerun with the size of each tool's output recorded. Output is cut at 24,000
+characters for every tool, as an agent's tool result would be. Tokens are estimated as characters / 4.
+
+| Tool | Answer shown | Median per search | Total for 98 searches | Tokens per answer shown |
+|---|---|---|---|---|
+| Threadline | **80** | ~6,000 tokens | ~587,000 | **~7,300** |
+| memex | 54 | ~6,000 | ~579,000 | ~10,700 |
+| ccrider | 18 | ~1,300 | ~242,000 | ~13,500 |
+| cass | 32 | ~6,000 | ~512,000 | ~16,000 |
+| recall-cli | 11 | ~2,400 | ~212,000 | ~19,300 |
+
+- Threadline fills its 24,000-character budget on purpose; recall-cli and ccrider return less per search
+  but rarely include the answer, so the agent has to open chats and spend more.
+- Without the cut, cass returned a median of 334,000 characters per search (its JSON holds whole
+  messages), and memex 93,000 at the runner's `--limit 60`.
+- Threadline's `resume`, the brief a new chat starts with, is about 4,000 tokens (16,000 characters) by
+  default.
+
 
 Rerun on 2026-11-26 (first run 2026-11-22) on one Mac (Apple Silicon, 8 cores), over the same chat history: Claude Code and Codex chats
 for a work project and Threadline itself.

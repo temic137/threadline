@@ -72,8 +72,18 @@ they are left out, and the page says so.
 
 Search combines word matching (SQLite FTS5) with search by meaning (a small local model,
 all-MiniLM-L6-v2, 90 MB, downloaded once). Set `HANDOFF_MEANING=0` to turn meaning search off.
+
+- **It returns the answer, not a pointer:** the passage inside a long message that answers the
+  question, so the agent rarely has to open the chat.
+- **The two searches are merged with reciprocal rank fusion**, so a message near the top of both lists
+  wins, and words found in more than 0.5% of messages don't count as matches.
+- **Results fit a fixed budget:** repeated messages appear once, and further matches are listed by name.
+- **Compressed Codex history (`.jsonl.zst`) is read**, and the journal is compressed with zstd
+  dictionaries trained on its own rows.
+
 [benchmark/RESULTS.md](benchmark/RESULTS.md) compares Threadline with four other history tools
-on real questions from real chats, including where it loses.
+on real questions from real chats: accuracy, tokens per answer, disk, build time and memory,
+including where it loses (searches are slower).
 
 ## Commands
 
